@@ -1,0 +1,379 @@
+import streamlit as st
+import pandas as pd
+import yfinance as yf
+import numpy as np
+import joblib
+import altair as alt
+from pathlib import Path
+from datetime import datetime
+import os
+
+
+from artifacts.loader import load_artifact
+from artifacts.predictors import ensure_schema, build_features, predict_model
+
+
+st.set_page_config(page_title="Stock Forecast (Hybrid)", page_icon="📈", layout="wide")
+st.title("📈 Stock Forecast App — Prophet + XGBoost")
+
+
+def _ensure_export_dir() -> Path:
+    d = Path("artifacts/plots")
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+def save_altair_png(chart: alt.Chart, path: Path) -> tuple[bool, str]:
+    """Save an Altair chart to a PNG file.
+    Tries vl-convert first, then kaleido. Returns (ok, message)."""
+    try:
+        # Altair 5: prefer vl-convert if available
+        chart.save(str(path), format="png", engine="vl-convert")
+        return True, f"Saved with vl-convert → {path}"
+    except Exception as e1:
+        try:
+            chart.save(str(path), format="png", engine="kaleido")
+            return True, f"Saved with kaleido → {path}"
+        except Exception as e2:
+            msg = (
+                f"Failed to export chart as PNG.\n"
+                f"vl-convert error: {e1}\n"
+                f"kaleido error: {e2}\n"
+                f"Install 'vl-convert-python' (recommended) or 'kaleido'."
+            )
+            return False, msg
+
+
+def resolve_artifact_path(preferred: str) -> str:
+    p = Path(preferred)
+    candidates = [
+        p,
+        Path("artifacts/notebooks/models") / p.name,
+        Path("artifacts/notebooks") / p.name,
+        Path("models") / p.name,
+        Path("artifacts/models") / p.name,
+    ]
+    for c in candidates:
+        try:
+            if c.exists():
+                return str(c)
+        except Exception:
+            continue
+    return str(p)
+
+
+# UI: ticker via buttons and horizon
+st.subheader("Select Ticker")
+cols = st.columns(3)
+chosen_ticker = "BUMI"
+if cols[0].button("BUMI"):
+    st.session_state["ticker"] = "BUMI.JK"
+    chosen_ticker = "BUMI"
+if cols[1].button("ELSA"):
+    st.session_state["ticker"] = "ELSA.JK"
+    chosen_ticker = "ELSA"
+if cols[2].button("DEWA"):
+    st.session_state["ticker"] = "DEWA.JK"
+    chosen_ticker = "DEWA"
+
+ticker = st.session_state.get("ticker", "BUMI.JK")
+# st.info(f"Active ticker: {ticker}")
+
+# n_periods = st.slider("Forecast horizon (days)", 1, 5, 5)
+n_periods = 5
+debug_mode = False
+
+
+# Download last 5 years daily data
+raw = yf.download(ticker, period="5y", interval="1d", progress=False, auto_adjust=True)
+raw = raw.reset_index()
+
+if isinstance(raw.columns, pd.MultiIndex):
+  raw.columns = [col[0] for col in raw.columns]
+
+# Ensure a datetime column named 'ds'
+if "Date" in raw.columns:
+    raw = raw.rename(columns={"Date": "ds"})
+else:
+    # find any datetime-like column and rename it to ds
+    for c in list(raw.columns):
+        try:
+            if pd.api.types.is_datetime64_any_dtype(raw[c]):
+                raw = raw.rename(columns={c: "ds"})
+                break
+            # attempt parse sample values
+            sample = raw[c].iloc[:5]
+            parsed = pd.to_datetime(sample, errors="coerce")
+            if parsed.notna().any():
+                raw = raw.rename(columns={c: "ds"})
+                break
+        except Exception:
+            continue
+
+if "ds" not in raw.columns and isinstance(raw.index, pd.DatetimeIndex):
+    raw["ds"] = raw.index
+    raw = raw.reset_index(drop=True)
+
+# Basic validation
+min_history = 50
+if len(raw) < min_history:
+    st.error(f"Not enough history to build features (>= {min_history} rows required).")
+    st.stop()
+
+df = ensure_schema(raw)
+feat = build_features(df)
+if feat is None or feat.empty:
+    st.error("Feature building failed; check data columns and history length.")
+    st.stop()
+
+# st.subheader("Latest data and features")
+# st.dataframe(feat.tail(200))
+
+
+# Load artifacts and predict
+models = {
+    "Hybrid"       : "models/" + chosen_ticker + "_hybrid.joblib",
+    "Prophet"      : "models/" + chosen_ticker + "_prophet.joblib",
+    "NHITS"        : "models/" + chosen_ticker + "_nhits.joblib",
+    "NeuralProphet": "models/" + chosen_ticker + "_neuralprophet_meta.joblib",
+}
+
+results = []
+missing_artifacts = []
+nhits_scaler_used = False
+nhits_pred_df = None
+
+for name, path in models.items():
+    resolved = resolve_artifact_path(path)
+    if not Path(resolved).exists():
+        missing_artifacts.append((name, path))
+        continue
+    try:
+        artifact = load_artifact(resolved)
+        # Warn if scaler missing; tailor check per model type
+        if debug_mode:
+            mt = (artifact.get("model_type") or "").lower()
+            missing = False
+            if mt in {"prophet", "hybrid", "neuralprophet"}:
+                missing = not bool(artifact.get("scaler"))
+            elif mt == "nhits":
+                # NHITS uses Darts Scaler objects for target and covariates
+                missing = not (bool(artifact.get("scaler_y")) and bool(artifact.get("scaler_cov")))
+            if missing:
+                msg = (
+                    f"{name}: artifact missing scaler — re-export including the fitted scaler to keep predictions on the correct price scale."
+                    if mt in {"prophet", "hybrid", "neuralprophet"}
+                    else f"{name}: artifact missing NHITS scalers (`scaler_y`/`scaler_cov`) — re-run NHITS notebook export to include them for consistent price-scale predictions."
+                )
+                st.warning(msg)
+        pred = predict_model(artifact, feat, n_periods, debug=debug_mode)
+        # Show a small debug note if NHITS used the persistence fallback
+        if debug_mode and name == "NHITS":
+            if artifact.get("_debug_nhits_fallback"):
+                fb = artifact.get("_debug_nhits_fallback", {})
+                last_close = fb.get("last_close")
+                st.info(f"NHITS fallback active: using last Close={last_close} for horizon due to NaN forecast.")
+            nhits_info = artifact.get("_debug_nhits_info")
+            nhits_mismatch = artifact.get("_debug_nhits_mismatch")
+            if nhits_info or nhits_mismatch:
+                with st.expander("NHITS debug details", expanded=False):
+                    if nhits_info:
+                        st.json(nhits_info)
+                    if nhits_mismatch:
+                        st.json({"feature_alignment": nhits_mismatch})
+            # Capture scaler presence and NHITS forecast for later display/export
+            nhits_scaler_used = bool(artifact.get("scaler_y"))
+            nhits_pred_df = pred.copy()
+        results.append(pred)
+    except Exception as e:
+        st.warning(f"{name} skipped: {e}")
+
+if missing_artifacts:
+    st.warning("Artifacts missing: " + ", ".join([f"{n} → {p}" for n, p in missing_artifacts]))
+
+
+# Output chart and table
+if results:
+    forecast = pd.concat(results)
+    hist = feat[["ds", "Close"]].set_index("ds")
+    fc = forecast.pivot(index="ds", columns="model", values="yhat")
+
+    # Rename columns to make it clear these are prices (IDR), not generic 'yhat'
+    fc = fc.rename(columns={
+        "Prophet": "Prophet (Price)",
+        "Hybrid": "Hybrid (Price)",
+        "NHITS": "NHITS (Price)",
+        "NeuralProphet": "NeuralProphet (Price)",
+    })
+    hist = hist.rename(columns={"Close": "Actual (Price)"})
+
+    # Heuristic rescaling fallback: if predictions are astronomically large compared to actual,
+    # align by last value ratio to keep plot readable when scaler is missing.
+    last_close = float(feat["Close"].iloc[-1])
+    def _try_rescale(series):
+        s = pd.to_numeric(series, errors="coerce")
+        if s.isna().all():
+            return series
+        med_diff = (s - last_close).abs().median()
+        if med_diff <= max(1e9, abs(last_close) * 1000):
+            return series
+        try:
+            last_pred = float(s.dropna().iloc[-1])
+        except Exception:
+            return series
+        if not np.isfinite(last_pred) or last_pred == 0:
+            return series
+        scale = last_pred / last_close
+        if scale > 1e6 or scale < 1e-6:
+            return series
+        candidate = s / scale
+        cand_med_diff = (candidate - last_close).abs().median()
+        if cand_med_diff < max(1e6, abs(last_close) * 50):
+            return candidate
+        return series
+
+    for col in list(fc.columns):
+        fc[col] = _try_rescale(fc[col])
+
+    chart_df = pd.concat([hist, fc], axis=1)
+
+    st.subheader("Forecast charts")
+
+    # Zoom controls
+    cols_ctrl = st.columns([1, 1, 2])
+    # with cols_ctrl[0]:
+    #     zoom_days = st.slider("Zoom window (days)", 30, 365, 180)
+    # with cols_ctrl[1]:
+    #     pad_pct = st.slider("Y-axis padding (%)", 0, 20, 5)
+    pad_pct = 5
+    zoom_days = 180
+    pad = pad_pct / 100.0
+
+    # Export controls
+    export_dir = _ensure_export_dir()
+    # export_enabled = st.checkbox("Enable chart export (PNG)", value=False)
+    ts_stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+    # Compute recent window for y-domain and optional x-window
+    hist_idx = chart_df.index
+    try:
+        cutoff = hist_idx.max() - pd.Timedelta(days=zoom_days)
+    except Exception:
+        cutoff = hist_idx.max()
+    recent = chart_df[chart_df.index >= cutoff]
+
+    # y-domain derived from recent values to "zoom into price"
+    vals = recent.to_numpy().astype(float)
+    finite_vals = vals[np.isfinite(vals)]
+    if finite_vals.size:
+        y_min = float(np.nanmin(finite_vals))
+        y_max = float(np.nanmax(finite_vals))
+        y_pad = (y_max - y_min) * pad if np.isfinite(y_max - y_min) else 0.0
+        y_domain = [y_min - y_pad, y_max + y_pad]
+    else:
+        y_domain = None
+
+    tabs = st.tabs(["Overview"] + list(fc.columns))
+
+    # Overview tab: combined actual + all models
+    with tabs[0]:
+        st.write("Overview: Actual and all model predictions")
+        # Build Altair overview chart with controlled y-axis domain
+        ov_df = recent.reset_index().rename(columns={"ds": "Date"})
+        ov_long = ov_df.melt(id_vars="Date", var_name="Series", value_name="Price")
+        y_enc = alt.Y("Price:Q", title="Price", scale=alt.Scale(domain=y_domain) if y_domain else alt.Scale())
+        x_enc = alt.X("Date:T", title="Date")
+        overview_chart = (
+            alt.Chart(ov_long)
+            .mark_line()
+            .encode(x=x_enc, y=y_enc, color=alt.Color("Series:N", title="Series"), tooltip=["Date:T", "Series:N", alt.Tooltip("Price:Q", format=",.2f")])
+        ).interactive()
+        st.altair_chart(overview_chart, use_container_width=True)
+        # if export_enabled:
+        #     col_a, col_b = st.columns([1, 2])
+        #     with col_a:
+        #         if st.button("Save overview PNG"):
+        #             fname = f"{chosen_ticker}_overview_{ts_stamp}.png"
+        #             fpath = export_dir / fname
+        #             ok, msg = save_altair_png(overview_chart, fpath)
+        #             if ok:
+        #                 st.success(msg)
+        #                 st.image(str(fpath))
+        #             else:
+        #                 st.error(msg)
+        st.subheader("Predicted prices (all models)")
+        st.dataframe(fc.reset_index().tail(n_periods))
+
+    # Individual tabs per model: actual vs a single model
+    for i, col in enumerate(fc.columns, start=1):
+        with tabs[i]:
+            st.write(f"Actual vs {col}")
+            model_df = pd.concat([hist, fc[[col]]], axis=1)
+            recent_model = model_df[model_df.index >= cutoff]
+            m_vals = recent_model.to_numpy().astype(float)
+            m_finite = m_vals[np.isfinite(m_vals)]
+            if m_finite.size:
+                m_y_min = float(np.nanmin(m_finite))
+                m_y_max = float(np.nanmax(m_finite))
+                m_pad = (m_y_max - m_y_min) * pad if np.isfinite(m_y_max - m_y_min) else 0.0
+                m_domain = [m_y_min - m_pad, m_y_max + m_pad]
+            else:
+                m_domain = None
+
+            mdl_df = recent_model.reset_index().rename(columns={"ds": "Date"})
+            mdl_long = mdl_df.melt(id_vars="Date", var_name="Series", value_name="Price")
+            mdl_chart = (
+                alt.Chart(mdl_long)
+                .mark_line()
+                .encode(
+                    x=alt.X("Date:T", title="Date"),
+                    y=alt.Y("Price:Q", title="Price", scale=alt.Scale(domain=m_domain) if m_domain else alt.Scale()),
+                    color=alt.Color("Series:N", title="Series"),
+                    tooltip=["Date:T", "Series:N", alt.Tooltip("Price:Q", format=",.2f")],
+                )
+            ).interactive()
+            st.altair_chart(mdl_chart, use_container_width=True)
+            # if export_enabled:
+            #     if st.button(f"Save {col} PNG", key=f"save_{i}_{col}"):
+            #         safe_name = col.replace(" (Price)", "").replace(" ", "_")
+            #         fname = f"{chosen_ticker}_{safe_name}_{ts_stamp}.png"
+            #         fpath = export_dir / fname
+            #         ok, msg = save_altair_png(mdl_chart, fpath)
+            #         if ok:
+            #             st.success(msg)
+            #             st.image(str(fpath))
+            #         else:
+            #             st.error(msg)
+            st.subheader("Predicted prices")
+            st.dataframe(fc[[col]].reset_index().tail(n_periods))
+
+    # NHITS reconstructed prices table and export
+    # if "NHITS (Price)" in fc.columns:
+    #     st.subheader("NHITS Reconstructed Prices")
+    #     if nhits_scaler_used:
+    #         st.caption("Prices reconstructed by inverse-transforming NHITS predictions to original scale.")
+    #     else:
+    #         st.caption("No NHITS scaler found; prices may rely on heuristic alignment or persistence fallback.")
+    #     nhits_table = fc[["NHITS (Price)"]].reset_index().rename(columns={"ds": "Date", "NHITS (Price)": "Price"})
+    #     st.dataframe(nhits_table.tail(n_periods))
+    #     csv_bytes = nhits_table.to_csv(index=False).encode("utf-8")
+    #     st.download_button(
+    #         label="Download NHITS reconstructed prices (CSV)",
+    #         data=csv_bytes,
+    #         file_name=f"{chosen_ticker}_NHITS_reconstructed_{ts_stamp}.csv",
+    #         mime="text/csv",
+    #     )
+
+    st.subheader("Metrics (if available)")
+    for name, path in models.items():
+        resolved = resolve_artifact_path(path)
+        try:
+            art = joblib.load(resolved)
+            if isinstance(art, dict) and "metrics" in art and art["metrics"]:
+                st.write(f"### {name}")
+                st.json(art["metrics"])
+        except Exception:
+            pass
