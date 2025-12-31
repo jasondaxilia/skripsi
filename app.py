@@ -65,6 +65,19 @@ def resolve_artifact_path(preferred: str) -> str:
     return str(p)
 
 
+# Cache Yahoo Finance downloads (data cache)
+@st.cache_data(show_spinner=False)
+def yf_download_cached(ticker: str, period: str = "5y", interval: str = "1d"):
+    return yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
+
+
+# Cache artifact loading (resource cache) with mtime-based invalidation
+@st.cache_resource(show_spinner=False)
+def cached_load_artifact(resolved_path: str, mtime: float):
+    # mtime participates in cache key; actual load uses path
+    return load_artifact(resolved_path)
+
+
 # UI: ticker via buttons and horizon
 st.subheader("Select Ticker")
 cols = st.columns(3)
@@ -87,8 +100,8 @@ n_periods = 5
 debug_mode = False
 
 
-# Download last 5 years daily data
-raw = yf.download(ticker, period="5y", interval="1d", progress=False, auto_adjust=True)
+# Download last 5 years daily data (cached)
+raw = yf_download_cached(ticker, period="5y", interval="1d")
 raw = raw.reset_index()
 
 if isinstance(raw.columns, pd.MultiIndex):
@@ -152,7 +165,12 @@ for name, path in models.items():
         missing_artifacts.append((name, path))
         continue
     try:
-        artifact = load_artifact(resolved)
+        # Use mtime to invalidate cache when artifact file changes
+        try:
+            mtime = Path(resolved).stat().st_mtime
+        except Exception:
+            mtime = -1.0
+        artifact = cached_load_artifact(resolved, mtime)
         # Warn if scaler missing; tailor check per model type
         if debug_mode:
             mt = (artifact.get("model_type") or "").lower()
