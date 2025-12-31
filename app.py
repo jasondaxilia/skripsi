@@ -56,9 +56,22 @@ def resolve_artifact_path(preferred: str) -> str:
         Path("models") / p.name,
         Path("artifacts/models") / p.name,
     ]
+    def _is_lfs_pointer(fp: Path) -> bool:
+        try:
+            if fp.is_file() and fp.stat().st_size < 2048:
+                with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                    head = f.read(256)
+                return head.startswith("version https://git-lfs.github.com/spec/v1")
+        except Exception:
+            pass
+        return False
+
     for c in candidates:
         try:
             if c.exists():
+                # Skip Git LFS pointer files; continue searching for real artifact
+                if _is_lfs_pointer(c):
+                    continue
                 return str(c)
         except Exception:
             continue

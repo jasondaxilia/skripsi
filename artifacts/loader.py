@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 import joblib
+import pickle
 
 
 # Simple in-memory cache keyed by (resolved-path, mtime)
@@ -39,17 +40,50 @@ def load_artifact(path: str) -> Dict[str, Any]:
     if not p.exists():
         raise FileNotFoundError(f"Artifact not found: {path}")
 
+    # Detect Git LFS pointer files and guide the user
+    try:
+        if p.is_file() and p.stat().st_size < 2048:
+            with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                head = f.read(256)
+            if head.startswith("version https://git-lfs.github.com/spec/v1"):
+                raise RuntimeError(
+                    (
+                        "The artifact at {} is a Git LFS pointer, not the actual binary. "
+                        "Fetch LFS objects (e.g., 'git lfs pull') or use the real artifact path."
+                    ).format(path)
+                )
+    except Exception:
+        # Non-fatal: continue to loader fallbacks
+        pass
+
     # Return from cache if present and file unchanged
     key = _cache_key(p)
     cached = _ARTIFACT_CACHE.get(key)
     if cached is not None:
         return cached
 
-    # Only joblib for now to match app.py expectations
+    # Try multiple strategies to load the artifact for robustness
     try:
         obj = joblib.load(str(p))
-    except Exception as e:
-        raise RuntimeError(f"Failed to load artifact via joblib at {path}: {e}")
+    except Exception as e1:
+        # Try memory-mapped mode which can help with large numpy arrays
+        try:
+            obj = joblib.load(str(p), mmap_mode="r")
+        except Exception as e2:
+            # Fallback to standard pickle in case the file isn't a joblib archive
+            try:
+                with open(p, "rb") as f:
+                    obj = pickle.load(f)
+            except Exception as e3:
+                raise RuntimeError(
+                    "Failed to load artifact at {}. "
+                    "joblib: {} ({}); joblib(mmap): {} ({}); pickle: {} ({})".format(
+                        path,
+                        type(e1).__name__, e1,
+                        type(e2).__name__, e2,
+                        type(e3).__name__, e3,
+                    )
+                )
 
     if not isinstance(obj, dict) or "model_type" not in obj:
         # Keep backward compatibility: wrap raw model objects if needed
