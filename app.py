@@ -106,7 +106,7 @@ if cols[2].button("DEWA"):
     chosen_ticker = "DEWA"
 
 ticker = st.session_state.get("ticker", "BUMI.JK")
-# st.info(f"Active ticker: {ticker}")
+st.info(f"Active ticker: {ticker}")
 
 # n_periods = st.slider("Forecast horizon (days)", 1, 5, 5)
 n_periods = 5
@@ -271,7 +271,7 @@ if results:
 
     chart_df = pd.concat([hist, fc], axis=1)
 
-    st.subheader("Forecast charts")
+    st.subheader(f"Forecast charts for {ticker} over next {n_periods} days")
 
     # Zoom controls
     cols_ctrl = st.columns([1, 1, 2])
