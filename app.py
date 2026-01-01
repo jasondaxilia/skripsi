@@ -96,16 +96,16 @@ st.subheader("Select Ticker")
 cols = st.columns(3)
 chosen_ticker = "BUMI"
 if cols[0].button("BUMI"):
-    st.session_state["ticker"] = "BUMI.JK"
+    st.session_state["ticker"] = "BUMI"
     chosen_ticker = "BUMI"
 if cols[1].button("ELSA"):
-    st.session_state["ticker"] = "ELSA.JK"
+    st.session_state["ticker"] = "ELSA"
     chosen_ticker = "ELSA"
 if cols[2].button("DEWA"):
-    st.session_state["ticker"] = "DEWA.JK"
+    st.session_state["ticker"] = "DEWA"
     chosen_ticker = "DEWA"
 
-ticker = st.session_state.get("ticker", "BUMI.JK")
+ticker = st.session_state.get("ticker", "BUMI")
 st.info(f"Active ticker: {ticker}")
 
 # n_periods = st.slider("Forecast horizon (days)", 1, 5, 5)
@@ -114,7 +114,7 @@ debug_mode = False
 
 
 # Download last 5 years daily data (cached)
-raw = yf_download_cached(ticker, period="5y", interval="1d")
+raw = yf_download_cached(ticker + ".JK", period="5y", interval="1d")
 raw = raw.reset_index()
 
 if isinstance(raw.columns, pd.MultiIndex):
