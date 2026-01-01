@@ -6,6 +6,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import logging as logging
+from darts.models import NHiTSModel
 
 def _np_expected_regressors(m) -> List[str]:
     """Best-effort introspection of NeuralProphet model to discover expected regressors.
@@ -291,15 +292,11 @@ def predict_model(artifact: Dict[str, Any], df: pd.DataFrame, periods: int, debu
         return out
 
     if model_type == "nhits":
-        m = artifact.get("model") or artifact.get("nhits")
-        # Prefer loading via Darts native serialization if a path is provided
         nhits_path = artifact.get("nhits_path")
-        if nhits_path:
-            try:
-                from darts.models import NHiTSModel as _NHiTS
-                m = _NHiTS.load(nhits_path)
-            except Exception:
-                pass
+        if not nhits_path:
+            raise ValueError("NHITS artifact missing 'nhits_path' (.darts file).")
+
+        m = NHiTSModel.load(nhits_path)
         if m is None:
             raise ValueError("NHITS artifact missing 'model'.")
 
