@@ -7,6 +7,49 @@ import pandas as pd
 import numpy as np
 import logging as logging
 
+def _np_expected_regressors(m) -> List[str]:
+    """Best-effort introspection of NeuralProphet model to discover expected regressors.
+    Supports multiple NP versions by checking several config locations.
+    """
+    names: List[str] = []
+    cfg = None
+    try:
+        cfg = getattr(m, "config_train", None) or getattr(m, "config", None)
+    except Exception:
+        cfg = None
+
+    candidates = []
+    # Common cases
+    try:
+        reg = getattr(cfg, "regressors", None)
+        if reg is not None:
+            if isinstance(reg, dict):
+                candidates.extend(list(reg.keys()))
+            elif isinstance(reg, (list, tuple)):
+                candidates.extend([str(x) for x in reg])
+    except Exception:
+        pass
+    # Other possible config fields across versions
+    for attr in [
+        "regressors_config",
+        "config_regressors",
+        "future_regressors",
+    ]:
+        try:
+            obj = getattr(cfg if cfg is not None else m, attr, None)
+            if obj is None:
+                continue
+            if isinstance(obj, dict):
+                candidates.extend(list(obj.keys()))
+            elif isinstance(obj, (list, tuple)):
+                candidates.extend([str(x) for x in obj])
+        except Exception:
+            pass
+
+    # Deduplicate and sort for stability
+    names = sorted(set([c for c in candidates if isinstance(c, str) and c]))
+    return names
+
 def _infer_freq_from_ds(ds: pd.Series) -> str | None:
     try:
         freq = pd.infer_freq(pd.to_datetime(ds))
@@ -94,17 +137,24 @@ def _predict_neuralprophet(m, df: pd.DataFrame, feature_cols: List[str] | None, 
         else:
             raise ValueError("NeuralProphet prediction requires 'y' (or 'Close') column in input dataframe.")
 
+    # Determine expected regressors from model; fall back to provided feature_cols
+    expected_regs = _np_expected_regressors(m)
+    use_feature_cols = feature_cols or []
+    if expected_regs:
+        # Align to model-expected names only
+        use_feature_cols = expected_regs
+
     # Ensure required feature columns exist; fill from last known or 0.0
-    if feature_cols:
-        missing_hist = [c for c in feature_cols if c not in df_in.columns]
+    if use_feature_cols:
+        missing_hist = [c for c in use_feature_cols if c not in df_in.columns]
         for c in missing_hist:
             df_in[c] = 0.0
         # Apply scaler to history features to match training preprocessing
         if scaler is not None:
             try:
-                Xh = df_in[feature_cols].values
+                Xh = df_in[use_feature_cols].values
                 Xh_scaled = scaler.transform(Xh)
-                df_in.loc[:, feature_cols] = Xh_scaled
+                df_in.loc[:, use_feature_cols] = Xh_scaled
             except Exception:
                 pass
 
@@ -122,21 +172,28 @@ def _predict_neuralprophet(m, df: pd.DataFrame, feature_cols: List[str] | None, 
         future["y"] = np.nan
 
     # Ensure future has all feature columns, carry forward last known values
-    if feature_cols:
-        for c in feature_cols:
+    if use_feature_cols:
+        for c in use_feature_cols:
             if c not in future.columns:
                 future[c] = df_in[c].iloc[-1] if c in df_in.columns else 0.0
+        # Drop any extra columns not expected by the model
+        extra_cols = [c for c in future.columns if c not in set(["ds", "y"]) | set(use_feature_cols)]
+        if extra_cols:
+            try:
+                future = future.drop(columns=extra_cols)
+            except Exception:
+                pass
         # Scale future feature values if scaler provided
         if scaler is not None:
             try:
-                Xf = future[feature_cols].values
+                Xf = future[use_feature_cols].values
                 Xf_scaled = scaler.transform(Xf)
-                future.loc[:, feature_cols] = Xf_scaled
+                future.loc[:, use_feature_cols] = Xf_scaled
             except Exception:
                 pass
 
     # Restrict to allowed columns only: ds, y, and declared regressors
-    use_cols = [c for c in ["ds", "y"] if c in future.columns] + (feature_cols or [])
+    use_cols = [c for c in ["ds", "y"] if c in future.columns] + (use_feature_cols or [])
     # Drop any unexpected columns (e.g., 'Close')
     try:
         future = future[use_cols]
@@ -145,13 +202,29 @@ def _predict_neuralprophet(m, df: pd.DataFrame, feature_cols: List[str] | None, 
         if "Close" in future.columns:
             future = future.drop(columns=["Close"])
 
+    # Try prediction; retry with stricter columns if mismatch errors arise
     try:
         fc = m.predict(future)
-    except KeyError as e:
+    except Exception as e:
+        msg = str(e)
         # Some NP versions error if 'y' is missing in future
-        if str(e) == "'y'" and "y" not in future.columns:
+        if isinstance(e, KeyError) and str(e) == "'y'" and "y" not in future.columns:
             future["y"] = np.nan
             fc = m.predict(future)
+        # Handle mismatch error: limits vs iterables (often due to regressor count mismatch)
+        elif "number of limits" in msg and "number of iterables" in msg:
+            try:
+                # Restrict to ds + expected regressors only; drop 'y' for strict future
+                cols_retry = ["ds"] + (use_feature_cols or [])
+                future_retry = future[cols_retry].copy()
+                fc = m.predict(future_retry)
+            except Exception:
+                # Final fallback: include 'y' as NaN and retry
+                try:
+                    future_retry["y"] = np.nan
+                    fc = m.predict(future_retry)
+                except Exception:
+                    raise
         else:
             raise
     # Normalize output column to 'yhat'
@@ -425,6 +498,11 @@ def predict_model(artifact: Dict[str, Any], df: pd.DataFrame, periods: int, debu
             raise ValueError("NeuralProphet artifact missing 'model'.")
         feature_cols = artifact.get("feature_columns")
         scaler = artifact.get("scaler")
+        # Debug: record expected regressors from the model
+        try:
+            artifact["_debug_np_expected_regressors"] = _np_expected_regressors(m)
+        except Exception:
+            pass
         out = _predict_neuralprophet(m, df, feature_cols or [], periods, scaler=scaler)
         out["model"] = "NeuralProphet"
         if debug:
