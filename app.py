@@ -93,19 +93,17 @@ def cached_load_artifact(resolved_path: str, mtime: float):
 
 # UI: ticker via buttons and horizon
 st.subheader("Select Ticker")
-cols = st.columns(3)
-chosen_ticker = "BUMI"
-if cols[0].button("BUMI"):
+# Initialize session state once
+if "ticker" not in st.session_state:
     st.session_state["ticker"] = "BUMI"
-    chosen_ticker = "BUMI"
-if cols[1].button("ELSA"):
-    st.session_state["ticker"] = "ELSA"
-    chosen_ticker = "ELSA"
-if cols[2].button("DEWA"):
-    st.session_state["ticker"] = "DEWA"
-    chosen_ticker = "DEWA"
 
-ticker = st.session_state.get("ticker", "BUMI")
+ticker = st.selectbox(
+    "Select ticker",
+    ("BUMI", "ELSA", "DEWA"),
+    index=("BUMI", "ELSA", "DEWA").index(st.session_state["ticker"]),
+    key="ticker"
+)
+chosen_ticker = ticker
 st.info(f"Active ticker: {ticker}")
 
 # n_periods = st.slider("Forecast horizon (days)", 1, 5, 5)
