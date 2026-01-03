@@ -321,20 +321,10 @@ if results:
             .encode(x=x_enc, y=y_enc, color=alt.Color("Series:N", title="Series"), tooltip=["Date:T", "Series:N", alt.Tooltip("Price:Q", format=",.2f")])
         ).interactive()
         st.altair_chart(overview_chart, use_container_width=True)
-        # if export_enabled:
-        #     col_a, col_b = st.columns([1, 2])
-        #     with col_a:
-        #         if st.button("Save overview PNG"):
-        #             fname = f"{chosen_ticker}_overview_{ts_stamp}.png"
-        #             fpath = export_dir / fname
-        #             ok, msg = save_altair_png(overview_chart, fpath)
-        #             if ok:
-        #                 st.success(msg)
-        #                 st.image(str(fpath))
-        #             else:
-        #                 st.error(msg)
         st.subheader("Predicted prices (all models)")
-        st.dataframe(fc.reset_index().tail(n_periods))
+        df_all = fc.reset_index().tail(n_periods)
+        df_all.insert(0, "No", range(1, len(df_all) + 1))
+        st.dataframe(df_all, hide_index=True)
 
     # Individual tabs per model: actual vs a single model
     for i, col in enumerate(fc.columns, start=1):
@@ -365,44 +355,41 @@ if results:
                 )
             ).interactive()
             st.altair_chart(mdl_chart, use_container_width=True)
-            # if export_enabled:
-            #     if st.button(f"Save {col} PNG", key=f"save_{i}_{col}"):
-            #         safe_name = col.replace(" (Price)", "").replace(" ", "_")
-            #         fname = f"{chosen_ticker}_{safe_name}_{ts_stamp}.png"
-            #         fpath = export_dir / fname
-            #         ok, msg = save_altair_png(mdl_chart, fpath)
-            #         if ok:
-            #             st.success(msg)
-            #             st.image(str(fpath))
-            #         else:
-            #             st.error(msg)
             st.subheader("Predicted prices")
-            st.dataframe(fc[[col]].reset_index().tail(n_periods))
+            df_single = fc[[col]].reset_index().tail(n_periods)
+            df_single.insert(0, "No", range(1, len(df_single) + 1))
+            st.dataframe(df_single, hide_index=True)
 
-    # NHITS reconstructed prices table and export
-    # if "NHITS (Price)" in fc.columns:
-    #     st.subheader("NHITS Reconstructed Prices")
-    #     if nhits_scaler_used:
-    #         st.caption("Prices reconstructed by inverse-transforming NHITS predictions to original scale.")
-    #     else:
-    #         st.caption("No NHITS scaler found; prices may rely on heuristic alignment or persistence fallback.")
-    #     nhits_table = fc[["NHITS (Price)"]].reset_index().rename(columns={"ds": "Date", "NHITS (Price)": "Price"})
-    #     st.dataframe(nhits_table.tail(n_periods))
-    #     csv_bytes = nhits_table.to_csv(index=False).encode("utf-8")
-    #     st.download_button(
-    #         label="Download NHITS reconstructed prices (CSV)",
-    #         data=csv_bytes,
-    #         file_name=f"{chosen_ticker}_NHITS_reconstructed_{ts_stamp}.csv",
-    #         mime="text/csv",
-    #     )
-
-    st.subheader("Metrics (if available)")
+    st.subheader("Metrics")
+    metrics_rows = []
     for name, path in models.items():
         resolved = resolve_artifact_path(path)
         try:
             art = joblib.load(resolved)
-            if isinstance(art, dict) and "metrics" in art and art["metrics"]:
-                st.write(f"### {name}")
-                st.json(art["metrics"])
+            metrics = art.get("metrics") if isinstance(art, dict) else None
+            if metrics:
+                # Normalize metrics to scalar/string values for tabular display
+                safe_metrics = {}
+                try:
+                    for k, v in metrics.items():
+                        if isinstance(v, (int, float, np.number)) or v is None:
+                            safe_metrics[k] = v
+                        elif isinstance(v, str):
+                            safe_metrics[k] = v
+                        else:
+                            safe_metrics[k] = str(v)
+                except Exception:
+                    # Fallback if metrics isn't a plain dict-like
+                    safe_metrics = {"metrics": str(metrics)}
+                metrics_rows.append({"Model": name, **safe_metrics})
         except Exception:
-            pass
+            continue
+    if metrics_rows:
+        df_metrics = pd.DataFrame(metrics_rows)
+        # Insert a numbered column on the left starting from 1
+        df_metrics.insert(0, "No", range(1, len(df_metrics) + 1))
+        ordered_cols = ["No", "Model"] + [c for c in df_metrics.columns if c not in {"No", "Model"}]
+        df_display = df_metrics[ordered_cols].set_index("No")
+        st.dataframe(df_display)
+    else:
+        st.info("No metrics available to display as a table.")
