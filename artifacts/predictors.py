@@ -125,120 +125,130 @@ def _predict_prophet(m, df: pd.DataFrame, feature_cols: List[str] | None, period
     return fc[["ds", "yhat"]]
 
 
-def _predict_neuralprophet(m, df: pd.DataFrame, feature_cols: List[str] | None, periods: int, scaler=None) -> pd.DataFrame:
-    """Predict with NeuralProphet, ensuring regressors are present and scaled.
-    Returns a dataframe with columns: ds, yhat
+def _predict_neuralprophet(m, df: pd.DataFrame, feature_cols: List[str] | None, periods: int, scaler=None, debug: bool = False) -> pd.DataFrame:
+    """Predict with NeuralProphet following exact notebook approach.
+    
+    CRITICAL NOTES from notebook:
+    - NeuralProphet uses normalize='minmax' internally for target
+    - Features are scaled with MinMaxScaler BEFORE passing to model
+    - Output 'yhat1' is already in ORIGINAL scale (auto-denormalized)
+    - Uses make_future_dataframe for proper future generation
+    
+    Returns: DataFrame with columns [ds, yhat]
     """
     df_in = df.copy()
 
-    # Ensure target column 'y' exists (NeuralProphet expects 'ds' + 'y')
+    # === SAVE ORIGINAL last_date BEFORE any processing ===
+    original_last_date = pd.to_datetime(df_in["ds"].iloc[-1])
+
+    # Ensure 'y' column exists (NeuralProphet requires 'ds' + 'y')
     if "y" not in df_in.columns:
         if "Close" in df_in.columns:
             df_in["y"] = df_in["Close"]
         else:
-            raise ValueError("NeuralProphet prediction requires 'y' (or 'Close') column in input dataframe.")
+            raise ValueError("NeuralProphet requires 'y' or 'Close' column")
 
-    # Determine expected regressors from model; fall back to provided feature_cols
+    # Determine features from model or fallback to provided
     expected_regs = _np_expected_regressors(m)
-    use_feature_cols = feature_cols or []
-    if expected_regs:
-        # Align to model-expected names only
-        use_feature_cols = expected_regs
+    use_feature_cols = expected_regs or feature_cols or []
 
-    # Ensure required feature columns exist; fill from last known or 0.0
+    # === CRITICAL: Prepare input with SCALED features (notebook approach) ===
     if use_feature_cols:
-        missing_hist = [c for c in use_feature_cols if c not in df_in.columns]
-        for c in missing_hist:
-            df_in[c] = 0.0
-        # Apply scaler to history features to match training preprocessing
-        if scaler is not None:
-            try:
-                Xh = df_in[use_feature_cols].values
-                Xh_scaled = scaler.transform(Xh)
-                df_in.loc[:, use_feature_cols] = Xh_scaled
-            except Exception:
-                pass
-
-    # Drop raw 'Close' to avoid unexpected column errors in NP
-    if "Close" in df_in.columns:
-        try:
-            df_in = df_in.drop(columns=["Close"])
-        except Exception:
-            pass
-
-    # Build future frame naively (robust across NP versions)
-    future = _future_frame_from_last(df_in, periods)
-    # Ensure future has placeholder target column to satisfy versions expecting 'y'
-    if "y" not in future.columns:
-        future["y"] = np.nan
-
-    # Ensure future has all feature columns, carry forward last known values
-    if use_feature_cols:
+        # Ensure all features exist
         for c in use_feature_cols:
-            if c not in future.columns:
-                future[c] = df_in[c].iloc[-1] if c in df_in.columns else 0.0
-        # Drop any extra columns not expected by the model
-        extra_cols = [c for c in future.columns if c not in set(["ds", "y"]) | set(use_feature_cols)]
-        if extra_cols:
-            try:
-                future = future.drop(columns=extra_cols)
-            except Exception:
-                pass
-        # Scale future feature values if scaler provided
+            if c not in df_in.columns:
+                df_in[c] = 0.0
+        
+        # Scale features ONLY (not target 'y' - NeuralProphet handles that)
         if scaler is not None:
             try:
-                Xf = future[use_feature_cols].values
-                Xf_scaled = scaler.transform(Xf)
-                future.loc[:, use_feature_cols] = Xf_scaled
-            except Exception:
-                pass
+                df_in[use_feature_cols] = scaler.transform(df_in[use_feature_cols])
+            except Exception as e:
+                st.warning(f"Feature scaling failed: {e}")
 
-    # Restrict to allowed columns only: ds, y, and declared regressors
-    use_cols = [c for c in ["ds", "y"] if c in future.columns] + (use_feature_cols or [])
-    # Drop any unexpected columns (e.g., 'Close')
+    # Clean up: drop 'Close' if exists to avoid confusion
+    if "Close" in df_in.columns:
+        df_in = df_in.drop(columns=["Close"], errors='ignore')
+
+    # === CRITICAL: Infer frequency from historical data (to skip weekends for stock data) ===
+    inferred_freq = _infer_freq_from_ds(df_in["ds"]) or "B"
+
+    # === Build future dataframe manually - USE ORIGINAL last_date and INFERRED frequency ===
     try:
-        future = future[use_cols]
+        future_dates = pd.date_range(original_last_date + pd.tseries.frequencies.to_offset(inferred_freq), periods=periods, freq=inferred_freq)
     except Exception:
-        # If subsetting fails, at least drop 'Close' explicitly
-        if "Close" in future.columns:
-            future = future.drop(columns=["Close"])
+        future_dates = pd.date_range(original_last_date + pd.Timedelta(days=1), periods=periods, freq=inferred_freq)
+    future = pd.DataFrame({"ds": future_dates})
+    
+    # CRITICAL: NeuralProphet REQUIRES 'y' column even for future (use NaN)
+    future["y"] = np.nan
+    
+    # Add all features (carry-forward last SCALED value from df_in)
+    for c in use_feature_cols:
+        if c in df_in.columns:
+            future[c] = df_in[c].iloc[-1]
+        else:
+            future[c] = 0.0
 
-    # Try prediction; retry with stricter columns if mismatch errors arise
+    # Predict
     try:
         fc = m.predict(future)
     except Exception as e:
-        msg = str(e)
-        # Some NP versions error if 'y' is missing in future
-        if isinstance(e, KeyError) and str(e) == "'y'" and "y" not in future.columns:
-            future["y"] = np.nan
-            fc = m.predict(future)
-        # Handle mismatch error: limits vs iterables (often due to regressor count mismatch)
-        elif "number of limits" in msg and "number of iterables" in msg:
-            try:
-                # Restrict to ds + expected regressors only; drop 'y' for strict future
-                cols_retry = ["ds"] + (use_feature_cols or [])
-                future_retry = future[cols_retry].copy()
-                fc = m.predict(future_retry)
-            except Exception:
-                # Final fallback: include 'y' as NaN and retry
-                try:
-                    future_retry["y"] = np.nan
-                    fc = m.predict(future_retry)
-                except Exception:
-                    raise
-        else:
-            raise
-    # Normalize output column to 'yhat'
-    if "yhat" in fc.columns:
+        st.error(f"❌ NeuralProphet prediction failed")
+        st.write("Error:", str(e))
+        st.write("Future shape:", future.shape)
+        st.write("Future columns:", future.columns.tolist())
+        st.write("Future sample:", future.head(2))
+        if use_feature_cols:
+            st.write("Expected features:", use_feature_cols)
+            st.write("Missing:", [c for c in use_feature_cols if c not in future.columns])
+        raise
+
+    # Extract predictions - yhat1 is ALREADY in original scale
+    if "yhat1" in fc.columns:
+        out = fc[["ds", "yhat1"]].rename(columns={"yhat1": "yhat"})
+    elif "yhat" in fc.columns:
         out = fc[["ds", "yhat"]].copy()
-    elif "yhat1" in fc.columns:
-        out = fc[["ds", "yhat1"]].copy()
-        out = out.rename(columns={"yhat1": "yhat"})
     else:
-        yhat_col = next((c for c in fc.columns if c.startswith("yhat")), None)
-        if yhat_col is None:
-            raise ValueError("NeuralProphet prediction output missing 'yhat' columns.")
-        out = fc[["ds", yhat_col]].copy().rename(columns={yhat_col: "yhat"})
+        # Find any yhat column
+        yhat_cols = [c for c in fc.columns if c.startswith("yhat")]
+        if not yhat_cols:
+            st.error("Available columns: " + str(fc.columns.tolist()))
+            raise ValueError("No 'yhat' column found in NeuralProphet output")
+        out = fc[["ds", yhat_cols[0]]].rename(columns={yhat_cols[0]: "yhat"})
+
+    # DEBUG: Check initial prediction length
+    initial_len = len(out)
+    
+    # === CRITICAL FIX: Ensure we have exactly 'periods' predictions ===
+    # If predictions are shorter, pad with last predicted value
+    if len(out) < periods:
+        if len(out) > 0:
+            last_pred = float(out["yhat"].iloc[-1])
+            last_date = pd.to_datetime(out["ds"].iloc[-1])
+            # Generate missing dates
+            missing_count = periods - len(out)
+            missing_dates = pd.date_range(last_date + pd.Timedelta(days=1), periods=missing_count, freq='D')
+            missing_df = pd.DataFrame({
+                "ds": missing_dates,
+                "yhat": [last_pred] * missing_count
+            })
+            out = pd.concat([out, missing_df], ignore_index=True)
+        else:
+            # No predictions at all - use persistence from input df - USE ORIGINAL last_date
+            try:
+                last_close = float(df["Close"].iloc[-1]) if "Close" in df.columns else float(df["y"].iloc[-1])
+                future_dates = pd.date_range(original_last_date + pd.Timedelta(days=1), periods=periods, freq='D')
+                out = pd.DataFrame({
+                    "ds": future_dates,
+                    "yhat": [last_close] * periods
+                })
+            except Exception as e:
+                raise RuntimeError(f"Failed to create fallback predictions for NeuralProphet: {e}")
+    
+    # Ensure exact length
+    out = out.head(periods).reset_index(drop=True)
+
     return out
 
 
@@ -249,9 +259,10 @@ def predict_model(artifact: Dict[str, Any], df: pd.DataFrame, periods: int, debu
     model_type = artifact.get("model_type", "unknown")
 
     if model_type == "prophet":
-        m = artifact.get("model") or artifact.get("prophet")
+        # === Notebook uses 'prophet' key, fallback to 'model' for compatibility ===
+        m = artifact.get("prophet") or artifact.get("model")
         if m is None:
-            raise ValueError("Prophet artifact missing 'model'.")
+            raise ValueError("Prophet artifact missing 'prophet' or 'model'.")
         feature_cols = artifact.get("feature_columns")
         scaler = artifact.get("scaler")
         out = _predict_prophet(m, df, feature_cols, periods, scaler=scaler)
@@ -328,8 +339,15 @@ def predict_model(artifact: Dict[str, Any], df: pd.DataFrame, periods: int, debu
         if "ds" not in df.columns:
             raise ValueError("NHITS prediction requires dataframe with 'ds' column.")
 
+        # === CRITICAL: Save original last_date BEFORE any preprocessing ===
+        original_last_date = pd.to_datetime(df["ds"].iloc[-1])
+
+        # === CRITICAL: Infer frequency for OUTPUT dates (to skip weekends for stock data) ===
+        # But NHITS internal processing uses freq='D' to match training
+        output_freq = _infer_freq_from_ds(df["ds"]) or "B"
+
         # Mirror notebook preprocessing to avoid NaNs
-        inferred_freq = "D"
+        inferred_freq = "D"  # NHITS was trained with freq='D', keep it for TimeSeries
         df_prophet = df.rename(columns={"Close": "y"}) if "Close" in df.columns else df.copy()
         if "y" not in df_prophet.columns:
             raise ValueError("NHITS requires 'Close' or 'y' column for target.")
@@ -346,11 +364,11 @@ def predict_model(artifact: Dict[str, Any], df: pd.DataFrame, periods: int, debu
         # Drop rows with missing target or features (matches notebook behavior)
         df_model_ready = df_model_ready.dropna(subset=["y"] + feature_cols).reset_index(drop=True)
 
-        # Target series
+        # Target series - NOTEBOOK APPROACH
         try:
-            ts_y = TimeSeries.from_dataframe(df_model_ready, "ds", "y", fill_missing_dates=True, freq=inferred_freq)
+            ts_y = TimeSeries.from_dataframe(df_model_ready, "ds", "y", fill_missing_dates=True, freq='D')
         except Exception:
-            ts_y = TimeSeries.from_dataframe(df_model_ready, "ds", "y", freq=inferred_freq)
+            ts_y = TimeSeries.from_dataframe(df_model_ready, "ds", "y", freq='D')
         try:
             ts_y = ts_y.fill_missing_values()
         except Exception:
@@ -360,16 +378,21 @@ def predict_model(artifact: Dict[str, Any], df: pd.DataFrame, periods: int, debu
         ts_cov = None
         if feature_cols:
             cov_hist = df_model_ready[["ds"] + feature_cols].copy()
-            last_date = pd.to_datetime(df_model_ready["ds"].iloc[-1])
-            future_dates = pd.date_range(last_date + pd.Timedelta(days=1), periods=periods, freq=inferred_freq)
+            # === CRITICAL FIX: Use ORIGINAL last_date, not processed df_model_ready last_date ===
+            # This ensures future dates align with other models
+            
+            # === NOTEBOOK USES explicit freq='D' ===
+            future_dates = pd.date_range(original_last_date + pd.Timedelta(days=1), periods=periods, freq='D')
             cov_future = pd.DataFrame({"ds": future_dates})
             for c in feature_cols:
                 cov_future[c] = cov_hist[c].iloc[-1]
             cov_ext = pd.concat([cov_hist, cov_future], ignore_index=True)
+            
+            # === NOTEBOOK APPROACH for TimeSeries creation ===
             try:
-                ts_cov = TimeSeries.from_dataframe(cov_ext, "ds", feature_cols, fill_missing_dates=True, freq=inferred_freq)
+                ts_cov = TimeSeries.from_dataframe(cov_ext, "ds", feature_cols, fill_missing_dates=True, freq='D')
             except Exception:
-                ts_cov = TimeSeries.from_dataframe(cov_ext, "ds", feature_cols, freq=inferred_freq)
+                ts_cov = TimeSeries.from_dataframe(cov_ext, "ds", feature_cols, freq='D')
             try:
                 ts_cov = ts_cov.fill_missing_values()
             except Exception:
@@ -378,6 +401,7 @@ def predict_model(artifact: Dict[str, Any], df: pd.DataFrame, periods: int, debu
         # Apply saved scalers when available
         ts_y_s = ts_y
         ts_cov_s = ts_cov
+        
         try:
             if scaler_y is not None and isinstance(scaler_y, DartsScaler):
                 ts_y_s = scaler_y.transform(ts_y)
@@ -415,6 +439,7 @@ def predict_model(artifact: Dict[str, Any], df: pd.DataFrame, periods: int, debu
 
         # Predict next N steps
         forecast_s = m.predict(n=periods, series=ts_y_s, past_covariates=ts_cov_s)
+        
         # Fallback: if prediction is entirely NaN, try without scaling
         try:
             vals_chk = forecast_s.values().flatten()
@@ -423,6 +448,7 @@ def predict_model(artifact: Dict[str, Any], df: pd.DataFrame, periods: int, debu
                 forecast_s = m.predict(n=periods, series=ts_y, past_covariates=ts_cov)
         except Exception:
             pass
+            
         # Inverse-transform to original scale if scaler_y provided
         try:
             if scaler_y is not None and isinstance(scaler_y, DartsScaler):
@@ -438,6 +464,7 @@ def predict_model(artifact: Dict[str, Any], df: pd.DataFrame, periods: int, debu
             has_finite = np.isfinite(np.nanmax(vals_chk))
         except Exception:
             has_finite = False
+                
         if not has_finite:
             last_close = None
             try:
@@ -454,8 +481,11 @@ def predict_model(artifact: Dict[str, Any], df: pd.DataFrame, periods: int, debu
             if last_close is not None and np.isfinite(last_close):
                 # Build a simple persistence forecast aligned to inferred frequency
                 from darts import TimeSeries as _TS
-                last_date = pd.to_datetime(df["ds"].iloc[-1])
-                future_dates = pd.date_range(last_date + pd.Timedelta(days=1), periods=periods, freq="D")
+                # === USE output_freq for dates (skip weekends) ===
+                try:
+                    future_dates = pd.date_range(original_last_date + pd.tseries.frequencies.to_offset(output_freq), periods=periods, freq=output_freq)
+                except Exception:
+                    future_dates = pd.date_range(original_last_date + pd.Timedelta(days=1), periods=periods, freq=output_freq)
                 fallback_df = pd.DataFrame({"ds": future_dates, "y": [last_close] * periods})
                 try:
                     forecast = _TS.from_dataframe(fallback_df, "ds", "y", fill_missing_dates=True, freq=inferred_freq)
@@ -466,33 +496,67 @@ def predict_model(artifact: Dict[str, Any], df: pd.DataFrame, periods: int, debu
                         "reason": "All-NaN forecast; using persistence fallback",
                         "last_close": last_close,
                     }
+        else:
+            # Forecast is valid - clear any previous fallback flag
+            if "_debug_nhits_fallback" in artifact:
+                del artifact["_debug_nhits_fallback"]
 
-        # Build output dataframe with future dates
-        last_date = pd.to_datetime(df["ds"].iloc[-1])
-        future_dates = pd.date_range(last_date + pd.Timedelta(days=1), periods=periods, freq="D")
+        # Build output dataframe with future dates - USE output_freq to skip weekends
+        try:
+            future_dates = pd.date_range(original_last_date + pd.tseries.frequencies.to_offset(output_freq), periods=periods, freq=output_freq)
+        except Exception:
+            future_dates = pd.date_range(original_last_date + pd.Timedelta(days=1), periods=periods, freq=output_freq)
         # Extract numeric forecast values robustly
         yhat_raw = forecast.values().flatten()
         try:
             yhat_num = pd.to_numeric(pd.Series(yhat_raw), errors="coerce").astype(float).values
         except Exception:
             yhat_num = np.array(yhat_raw, dtype=float)
-        # Align lengths just in case
-        min_len = min(len(future_dates), len(yhat_num))
+        
+        # DEBUG: Check initial forecast length
+        initial_len = len(yhat_num)
+        
+        # === CRITICAL FIX: Ensure we have exactly 'periods' predictions ===
+        # If predictions are shorter, pad with last predicted value
+        if len(yhat_num) < periods:
+            st.warning(f"⚠️ NHITS: Got {len(yhat_num)} predictions, need {periods}. Padding now...")
+            if len(yhat_num) > 0:
+                last_pred = float(yhat_num[-1])
+                padding = np.full(periods - len(yhat_num), last_pred)
+                yhat_num = np.concatenate([yhat_num, padding])
+                st.info(f"✅ NHITS: Padded {periods - initial_len} days with value {last_pred:.2f}")
+            else:
+                # No predictions at all - use persistence
+                st.error("⚠️ NHITS: No predictions generated! Using fallback...")
+                try:
+                    last_close = float(df["Close"].iloc[-1]) if "Close" in df.columns else float(ts_y.last_value())
+                    yhat_num = np.full(periods, last_close)
+                    st.info(f"✅ NHITS: Created {periods} fallback predictions with value {last_close:.2f}")
+                except Exception as e:
+                    st.error(f"NHITS fallback failed: {e}")
+                    yhat_num = np.full(periods, np.nan)
+        
+        # Ensure exact length match
+        yhat_num = yhat_num[:periods]
+        
         out = pd.DataFrame({
-            "ds": future_dates[:min_len],
-            "yhat": yhat_num[:min_len],
+            "ds": future_dates,
+            "yhat": yhat_num,
         })
         # Align label with app expectations
         out["model"] = "NHITS"
         if debug:
             artifact["_debug_series_y"] = ts_y
             artifact["_debug_series_cov"] = ts_cov
+            artifact["_debug_yhat_length"] = len(yhat_num)
+            artifact["_debug_initial_len"] = initial_len
         return out
       
     if model_type == "neuralprophet":
-        m = artifact.get("model") or artifact.get("neuralprophet")
+        # === CRITICAL FIX: Support both 'neuralprophet' and 'model' keys (notebook uses 'neuralprophet') ===
+        m = artifact.get("neuralprophet") or artifact.get("model")
         if m is None:
-            raise ValueError("NeuralProphet artifact missing 'model'.")
+            raise ValueError("NeuralProphet artifact missing 'neuralprophet' or 'model'.")
         feature_cols = artifact.get("feature_columns")
         scaler = artifact.get("scaler")
         # Debug: record expected regressors from the model
@@ -500,7 +564,7 @@ def predict_model(artifact: Dict[str, Any], df: pd.DataFrame, periods: int, debu
             artifact["_debug_np_expected_regressors"] = _np_expected_regressors(m)
         except Exception:
             pass
-        out = _predict_neuralprophet(m, df, feature_cols or [], periods, scaler=scaler)
+        out = _predict_neuralprophet(m, df, feature_cols or [], periods, scaler=scaler, debug=debug)
         out["model"] = "NeuralProphet"
         if debug:
             artifact["_debug_future"] = out

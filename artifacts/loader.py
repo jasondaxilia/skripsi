@@ -99,6 +99,25 @@ def load_artifact(path: str) -> Dict[str, Any]:
                 _ARTIFACT_CACHE.pop(k, None)
         return wrapped
 
+    # === CRITICAL FIX: Load NeuralProphet from saved path if model_type is neuralprophet ===
+    # NeuralProphet often can't be pickled directly, so notebook saves it via model.save()
+    # and stores the path in 'model_dir' key
+    if obj.get("model_type") == "neuralprophet":
+        # Check if model was saved via NeuralProphet.save() method
+        if "model_dir" in obj and "neuralprophet" not in obj:
+            model_dir = obj.get("model_dir")
+            try:
+                from neuralprophet import NeuralProphet
+                # Load model from saved directory
+                neural_model = NeuralProphet.load(model_dir)
+                obj["neuralprophet"] = neural_model
+                print(f"✅ Loaded NeuralProphet from: {model_dir}")
+            except Exception as e:
+                import streamlit as st
+                st.warning(f"Failed to load NeuralProphet from {model_dir}: {e}")
+                # Don't cache this incomplete artifact
+                return obj
+
     # Cache the successfully loaded dict artifact
     _ARTIFACT_CACHE[key] = obj
     # Purge older versions of same path (different mtime)
@@ -106,3 +125,4 @@ def load_artifact(path: str) -> Dict[str, Any]:
         if k[0] == key[0] and k != key:
             _ARTIFACT_CACHE.pop(k, None)
     return obj
+
