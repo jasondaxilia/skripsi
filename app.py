@@ -14,7 +14,7 @@ from artifacts.predictors import ensure_schema, build_features, predict_model
 
 
 st.set_page_config(page_title="Stock Forecast (Hybrid)", page_icon="📈", layout="wide")
-st.title("📈 Stock Forecast App — Prophet + XGBoost")
+st.title("📈 Stock Forecast Web")
 
 
 def _ensure_export_dir() -> Path:
@@ -166,7 +166,6 @@ if predict_button:
         "Hybrid"       : "models/" + chosen_ticker + "_hybrid.joblib",
         "Prophet"      : "models/" + chosen_ticker + "_prophet.joblib",
         "NHITS"        : "models/" + chosen_ticker + "_nhits.joblib",
-        "N-BEATS"      : "models/" + chosen_ticker + "_nbeats.joblib",
         "NeuralProphet": "models/" + chosen_ticker + "_neuralprophet_meta.joblib",
     }
 
@@ -196,10 +195,6 @@ if predict_button:
                 elif mt == "nhits":
                     # NHITS uses Darts Scaler objects for target and covariates
                     missing = not (bool(artifact.get("scaler_y")) and bool(artifact.get("scaler_cov")))
-                elif mt == "nbeats":
-                    # N-BEATS uses raw prices (no scaling), so scaler should be None
-                    if artifact.get("scaler") is not None:
-                        st.info(f"{name}: N-BEATS should use raw prices (scaler=None), but found scaler object.")
                 if missing:
                     msg = (
                         f"{name}: artifact missing scaler — re-export including the fitted scaler to keep predictions on the correct price scale."
@@ -245,7 +240,6 @@ if predict_button:
             "Prophet": "Prophet (Price)",
             "Hybrid": "Hybrid (Price)",
             "NHITS": "NHITS (Price)",
-            "N-BEATS": "N-BEATS (Price)",
             "NeuralProphet": "NeuralProphet (Price)",
         })
         hist = hist.rename(columns={"Close": "Actual (Price)"})
