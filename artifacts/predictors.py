@@ -551,6 +551,124 @@ def predict_model(artifact: Dict[str, Any], df: pd.DataFrame, periods: int, debu
             artifact["_debug_yhat_length"] = len(yhat_num)
             artifact["_debug_initial_len"] = initial_len
         return out
+    
+    if model_type == "nbeats":
+        # N-BEATS is a univariate model (uses only Close/y, no features)
+        from darts.models import NBEATSModel
+        from darts import TimeSeries
+        
+        m = artifact.get("model")
+        if m is None or not isinstance(m, NBEATSModel):
+            raise ValueError("N-BEATS artifact missing 'model' (NBEATSModel instance).")
+        
+        # N-BEATS uses raw prices (no scaling)
+        target_col = "y" if "y" in df.columns else ("Close" if "Close" in df.columns else None)
+        if target_col is None:
+            raise ValueError("N-BEATS prediction requires either 'y' or 'Close' column as target.")
+        
+        # Prepare data
+        if "ds" not in df.columns:
+            raise ValueError("N-BEATS prediction requires dataframe with 'ds' column.")
+        
+        # Save original last date
+        original_last_date = pd.to_datetime(df["ds"].iloc[-1])
+        
+        # Infer frequency for output dates (skip weekends for stock data)
+        output_freq = _infer_freq_from_ds(df["ds"]) or "B"
+        
+        # Create TimeSeries for target - use freq='D' like in notebook
+        df_target = df[["ds", target_col]].copy()
+        df_target.columns = ["ds", "y"]
+        df_target["ds"] = pd.to_datetime(df_target["ds"])
+        
+        # Clean data
+        df_target["y"] = pd.to_numeric(df_target["y"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        df_target = df_target.dropna(subset=["y"]).reset_index(drop=True)
+        
+        # Create TimeSeries with freq='D' and fill_missing_dates=True (matches notebook approach)
+        try:
+            ts_y = TimeSeries.from_dataframe(df_target, "ds", "y", fill_missing_dates=True, freq='D')
+        except Exception:
+            # Fallback: try inferring freq automatically
+            try:
+                ts_y = TimeSeries.from_dataframe(df_target, "ds", "y", fill_missing_dates=True, freq=None)
+            except Exception:
+                # Last resort: no freq inference
+                ts_y = TimeSeries.from_dataframe(df_target, "ds", "y")
+        
+        # Predict using N-BEATS
+        try:
+            forecast = m.predict(n=periods, series=ts_y)
+        except Exception as e:
+            # Fallback to persistence if prediction fails
+            if debug:
+                artifact["_debug_nbeats_error"] = str(e)
+            last_close = float(df_target["y"].iloc[-1])
+            try:
+                future_dates = pd.date_range(
+                    original_last_date + pd.tseries.frequencies.to_offset(output_freq),
+                    periods=periods,
+                    freq=output_freq
+                )
+            except Exception:
+                future_dates = pd.date_range(
+                    original_last_date + pd.Timedelta(days=1),
+                    periods=periods,
+                    freq=output_freq
+                )
+            out = pd.DataFrame({
+                "ds": future_dates,
+                "yhat": [last_close] * periods,
+            })
+            out["model"] = "N-BEATS"
+            return out
+        
+        # Extract predictions
+        yhat_raw = forecast.values().flatten()
+        try:
+            yhat_num = pd.to_numeric(pd.Series(yhat_raw), errors="coerce").astype(float).values
+        except Exception:
+            yhat_num = np.array(yhat_raw, dtype=float)
+        
+        # Ensure we have exactly 'periods' predictions
+        if len(yhat_num) < periods:
+            if len(yhat_num) > 0:
+                last_pred = float(yhat_num[-1])
+                padding = np.full(periods - len(yhat_num), last_pred)
+                yhat_num = np.concatenate([yhat_num, padding])
+            else:
+                # No predictions - use persistence
+                last_close = float(df_target["y"].iloc[-1])
+                yhat_num = np.full(periods, last_close)
+        
+        # Ensure exact length
+        yhat_num = yhat_num[:periods]
+        
+        # Generate future dates
+        try:
+            future_dates = pd.date_range(
+                original_last_date + pd.tseries.frequencies.to_offset(output_freq),
+                periods=periods,
+                freq=output_freq
+            )
+        except Exception:
+            future_dates = pd.date_range(
+                original_last_date + pd.Timedelta(days=1),
+                periods=periods,
+                freq=output_freq
+            )
+        
+        out = pd.DataFrame({
+            "ds": future_dates,
+            "yhat": yhat_num,
+        })
+        out["model"] = "N-BEATS"
+        
+        if debug:
+            artifact["_debug_ts_y"] = ts_y
+            artifact["_debug_forecast"] = forecast
+        
+        return out
       
     if model_type == "neuralprophet":
         # === CRITICAL FIX: Support both 'neuralprophet' and 'model' keys (notebook uses 'neuralprophet') ===
