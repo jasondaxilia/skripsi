@@ -167,6 +167,7 @@ if predict_button:
         "Prophet"      : "models/" + chosen_ticker + "_prophet.joblib",
         "NHITS"        : "models/" + chosen_ticker + "_nhits.joblib",
         "NeuralProphet": "models/" + chosen_ticker + "_neuralprophet_meta.joblib",
+        "N-BEATS"      : "models/" + chosen_ticker + "_nbeats.joblib",
     }
 
     results = []
@@ -241,6 +242,7 @@ if predict_button:
             "Hybrid": "Hybrid (Price)",
             "NHITS": "NHITS (Price)",
             "NeuralProphet": "NeuralProphet (Price)",
+            "N-BEATS": "N-BEATS (Price)",
         })
         hist = hist.rename(columns={"Close": "Actual (Price)"})
 

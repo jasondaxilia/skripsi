@@ -553,96 +553,151 @@ def predict_model(artifact: Dict[str, Any], df: pd.DataFrame, periods: int, debu
         return out
     
     if model_type == "nbeats":
-        # N-BEATS is a univariate model (uses only Close/y, no features)
-        from darts.models import NBEATSModel
-        from darts import TimeSeries
+        # Custom PyTorch N-BEATS implementation (not Darts)
+        import torch
+        import torch.nn as nn
         
-        m = artifact.get("model")
-        if m is None or not isinstance(m, NBEATSModel):
-            raise ValueError("N-BEATS artifact missing 'model' (NBEATSModel instance).")
+        # Define N-BEATS architecture classes (must match notebook)
+        class NBeatsBlock(nn.Module):
+            """Single N-BEATS Block with basis expansion"""
+            def __init__(self, input_size, theta_size, basis_function, num_layers, layer_width):
+                super().__init__()
+                self.input_size = input_size
+                self.theta_size = theta_size
+                self.basis_function = basis_function
+                
+                # Fully connected layers
+                layers = [nn.Linear(input_size, layer_width), nn.ReLU()]
+                for _ in range(num_layers - 1):
+                    layers.extend([nn.Linear(layer_width, layer_width), nn.ReLU()])
+                self.fc = nn.Sequential(*layers)
+                
+                # Theta layers for backcast and forecast
+                self.theta_b = nn.Linear(layer_width, theta_size)
+                self.theta_f = nn.Linear(layer_width, theta_size)
+                
+            def forward(self, x):
+                h = self.fc(x)
+                theta_b = self.theta_b(h)
+                theta_f = self.theta_f(h)
+                backcast = self.basis_function(theta_b, self.input_size)
+                forecast = self.basis_function(theta_f, self.input_size)
+                return backcast, forecast
+
+        class NBEATSNet(nn.Module):
+            """N-BEATS Network with multiple stacks"""
+            def __init__(self, input_size, output_size, num_stacks=5, num_blocks=3, 
+                         num_layers=4, layer_width=256, theta_size=None):
+                super().__init__()
+                self.input_size = input_size
+                self.output_size = output_size
+                
+                if theta_size is None:
+                    theta_size = max(input_size, output_size)
+                
+                # Generic basis function
+                basis_function = lambda theta, size: theta[:, :size] if theta.shape[-1] >= size else \
+                                 torch.nn.functional.pad(theta, (0, size - theta.shape[-1]))
+                
+                # Build stacks of blocks
+                self.stacks = nn.ModuleList()
+                for _ in range(num_stacks):
+                    stack = nn.ModuleList()
+                    for _ in range(num_blocks):
+                        block = NBeatsBlock(input_size, theta_size, basis_function, 
+                                           num_layers, layer_width)
+                        stack.append(block)
+                    self.stacks.append(stack)
+                    
+            def forward(self, x):
+                batch_size = x.shape[0]
+                forecast = torch.zeros(batch_size, self.output_size, device=x.device)
+                residual = x
+                for stack in self.stacks:
+                    for block in stack:
+                        backcast, block_forecast = block(residual)
+                        residual = residual - backcast
+                        if block_forecast.shape[-1] >= self.output_size:
+                            forecast = forecast + block_forecast[:, :self.output_size]
+                        else:
+                            padded = torch.nn.functional.pad(
+                                block_forecast, 
+                                (0, self.output_size - block_forecast.shape[-1])
+                            )
+                            forecast = forecast + padded
+                return forecast
         
-        # N-BEATS uses raw prices (no scaling)
+        # Load configuration and state_dict
+        config = artifact.get("config")
+        model_state_dict = artifact.get("model_state_dict")
+        scaler = artifact.get("scaler")
+        
+        if config is None or model_state_dict is None:
+            raise ValueError("N-BEATS artifact missing 'config' or 'model_state_dict'.")
+        
+        # Recreate model architecture
+        device = torch.device('cpu')  # Use CPU for inference
+        model = NBEATSNet(
+            input_size=config['input_size'],
+            output_size=config['output_size'],
+            num_stacks=config.get('num_stacks', 3),
+            num_blocks=config.get('num_blocks', 3),
+            num_layers=config.get('num_layers', 3),
+            layer_width=config.get('layer_width', 128),
+            theta_size=config.get('theta_size')
+        ).to(device)
+        
+        # Load trained weights
+        model.load_state_dict(model_state_dict)
+        model.eval()
+        
+        # Get target data
         target_col = "y" if "y" in df.columns else ("Close" if "Close" in df.columns else None)
         if target_col is None:
             raise ValueError("N-BEATS prediction requires either 'y' or 'Close' column as target.")
         
-        # Prepare data
         if "ds" not in df.columns:
             raise ValueError("N-BEATS prediction requires dataframe with 'ds' column.")
         
         # Save original last date
         original_last_date = pd.to_datetime(df["ds"].iloc[-1])
-        
-        # Infer frequency for output dates (skip weekends for stock data)
         output_freq = _infer_freq_from_ds(df["ds"]) or "B"
         
-        # Create TimeSeries for target - use freq='D' like in notebook
-        df_target = df[["ds", target_col]].copy()
-        df_target.columns = ["ds", "y"]
-        df_target["ds"] = pd.to_datetime(df_target["ds"])
+        # Extract and prepare data
+        close_prices = df[target_col].values
+        lookback = config['lookback']
         
-        # Clean data
-        df_target["y"] = pd.to_numeric(df_target["y"], errors="coerce").replace([np.inf, -np.inf], np.nan)
-        df_target = df_target.dropna(subset=["y"]).reset_index(drop=True)
+        # Scale data if scaler provided
+        if scaler is not None:
+            close_scaled = scaler.transform(close_prices.reshape(-1, 1)).flatten()
+        else:
+            close_scaled = close_prices
         
-        # Create TimeSeries with freq='D' and fill_missing_dates=True (matches notebook approach)
-        try:
-            ts_y = TimeSeries.from_dataframe(df_target, "ds", "y", fill_missing_dates=True, freq='D')
-        except Exception:
-            # Fallback: try inferring freq automatically
-            try:
-                ts_y = TimeSeries.from_dataframe(df_target, "ds", "y", fill_missing_dates=True, freq=None)
-            except Exception:
-                # Last resort: no freq inference
-                ts_y = TimeSeries.from_dataframe(df_target, "ds", "y")
+        # Multi-step forecasting (iterative approach from notebook)
+        predictions_scaled = []
+        current_sequence = close_scaled[-lookback:].copy()
         
-        # Predict using N-BEATS
-        try:
-            forecast = m.predict(n=periods, series=ts_y)
-        except Exception as e:
-            # Fallback to persistence if prediction fails
-            if debug:
-                artifact["_debug_nbeats_error"] = str(e)
-            last_close = float(df_target["y"].iloc[-1])
-            try:
-                future_dates = pd.date_range(
-                    original_last_date + pd.tseries.frequencies.to_offset(output_freq),
-                    periods=periods,
-                    freq=output_freq
-                )
-            except Exception:
-                future_dates = pd.date_range(
-                    original_last_date + pd.Timedelta(days=1),
-                    periods=periods,
-                    freq=output_freq
-                )
-            out = pd.DataFrame({
-                "ds": future_dates,
-                "yhat": [last_close] * periods,
-            })
-            out["model"] = "N-BEATS"
-            return out
+        with torch.no_grad():
+            for i in range(periods):
+                # Prepare input
+                x_input = torch.FloatTensor(current_sequence).unsqueeze(0).to(device)
+                
+                # Predict
+                pred = model(x_input)
+                pred_value = pred.cpu().numpy()[0, 0]
+                
+                # Store prediction
+                predictions_scaled.append(pred_value)
+                
+                # Update sequence (autoregressive: use prediction for next step)
+                current_sequence = np.append(current_sequence[1:], pred_value)
         
-        # Extract predictions
-        yhat_raw = forecast.values().flatten()
-        try:
-            yhat_num = pd.to_numeric(pd.Series(yhat_raw), errors="coerce").astype(float).values
-        except Exception:
-            yhat_num = np.array(yhat_raw, dtype=float)
-        
-        # Ensure we have exactly 'periods' predictions
-        if len(yhat_num) < periods:
-            if len(yhat_num) > 0:
-                last_pred = float(yhat_num[-1])
-                padding = np.full(periods - len(yhat_num), last_pred)
-                yhat_num = np.concatenate([yhat_num, padding])
-            else:
-                # No predictions - use persistence
-                last_close = float(df_target["y"].iloc[-1])
-                yhat_num = np.full(periods, last_close)
-        
-        # Ensure exact length
-        yhat_num = yhat_num[:periods]
+        # Inverse transform to original scale
+        if scaler is not None:
+            predictions_scaled_arr = np.array(predictions_scaled).reshape(-1, 1)
+            yhat_num = scaler.inverse_transform(predictions_scaled_arr).flatten()
+        else:
+            yhat_num = np.array(predictions_scaled)
         
         # Generate future dates
         try:
@@ -665,8 +720,9 @@ def predict_model(artifact: Dict[str, Any], df: pd.DataFrame, periods: int, debu
         out["model"] = "N-BEATS"
         
         if debug:
-            artifact["_debug_ts_y"] = ts_y
-            artifact["_debug_forecast"] = forecast
+            artifact["_debug_lookback"] = lookback
+            artifact["_debug_predictions_scaled"] = predictions_scaled
+            artifact["_debug_current_sequence"] = current_sequence.tolist()
         
         return out
       
