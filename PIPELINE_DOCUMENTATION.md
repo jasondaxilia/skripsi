@@ -859,6 +859,98 @@ def load_artifact(path: str) -> Dict[str, Any]:
     return obj
 ```
 
+#### 9.3.3 Penjelasan Detail Artifact Loading
+
+Artifact Loading adalah proses **memuat model yang sudah dilatih** dari file `.joblib` ke dalam memori aplikasi Streamlit untuk digunakan saat prediksi (inference).
+
+##### Alur Kerja Loading
+
+```
+┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+│  File .joblib   │ ───▶ │  joblib.load()  │ ───▶ │ Dictionary      │ ───▶ │ Prediksi Model  │
+│  (di disk)      │      │  (deserialize)  │      │ Python (RAM)    │      │ predict_model() │
+└─────────────────┘      └─────────────────┘      └─────────────────┘      └─────────────────┘
+```
+
+##### Strategi Loading dengan Fallback
+
+Fungsi `load_artifact()` menggunakan **3 strategi berurutan** untuk memastikan file bisa dimuat meskipun ada masalah kompatibilitas:
+
+| Urutan | Strategi | Mode | Kapan Digunakan |
+|--------|----------|------|-----------------|
+| 1️⃣ | `joblib.load(path)` | Normal | Default, paling cepat dan umum digunakan |
+| 2️⃣ | `joblib.load(path, mmap_mode="r")` | Memory-mapped | Jika strategi 1 gagal, cocok untuk file besar |
+| 3️⃣ | `pickle.load(file)` | Standard pickle | Fallback terakhir jika joblib tidak kompatibel |
+
+**Mengapa perlu fallback?**
+- Versi `joblib` atau `scikit-learn` yang berbeda bisa menyebabkan incompatibility
+- File yang di-save di mesin berbeda mungkin memiliki format yang sedikit berbeda
+- Memory-mapped mode berguna untuk file sangat besar yang tidak muat di RAM
+
+##### Special Handling untuk NeuralProphet
+
+NeuralProphet memiliki **penanganan khusus** karena arsitektur penyimpanannya berbeda:
+
+```python
+if obj.get("model_type") == "neuralprophet":
+    if "model_dir" in obj and "neuralprophet" not in obj:
+        from neuralprophet import NeuralProphet
+        obj["neuralprophet"] = NeuralProphet.load(obj["model_dir"])
+```
+
+**Alasan:**
+- NeuralProphet menggunakan **PyTorch** di belakang layar
+- Model PyTorch disimpan ke **direktori terpisah**, bukan langsung ke file `.joblib`
+- Artifact `.joblib` hanya menyimpan **path ke direktori model** (`model_dir`)
+- Saat loading, model NeuralProphet dimuat dari direktori tersebut
+
+##### Caching di Streamlit
+
+Di `app.py`, loading artifact dibungkus dengan decorator `@st.cache_resource`:
+
+```python
+@st.cache_resource
+def cached_load_artifact(path: str):
+    return load_artifact(path)
+```
+
+**Keuntungan Caching:**
+
+| Aspek | Tanpa Cache | Dengan Cache |
+|-------|-------------|--------------|
+| **Load pertama** | ~2-5 detik | ~2-5 detik |
+| **Load berikutnya** | ~2-5 detik | ~0.001 detik |
+| **Memory usage** | Multiple copies | Single copy (shared) |
+| **User experience** | Lambat setiap request | Cepat setelah pertama kali |
+
+##### Mengapa Artifact Loading Penting?
+
+| Aspek | Dampak |
+|-------|--------|
+| **Portabilitas** | Model bisa di-train di satu mesin (laptop/server GPU), deploy di mesin lain (cloud/server produksi) |
+| **Efisiensi** | Tidak perlu re-train setiap kali aplikasi dijalankan; training bisa memakan waktu berjam-jam |
+| **Konsistensi** | Scaler dan feature columns tersimpan **bersama** model, mencegah mismatch antara training dan inference |
+| **Robustness** | Fallback mechanism memastikan aplikasi tidak crash meskipun ada masalah loading |
+| **Reproducibility** | Hasil prediksi konsisten karena menggunakan model yang sama persis |
+
+##### Komponen yang Tersimpan dalam Artifact
+
+Setiap artifact menyimpan **semua komponen yang diperlukan** untuk melakukan prediksi:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        ARTIFACT                             │
+├─────────────────────────────────────────────────────────────┤
+│  model_type    : Identifier jenis model                     │
+│  model object  : Model yang sudah di-train (Prophet/XGB/dll)│
+│  scaler        : Scaler untuk normalisasi features          │
+│  feature_columns: List nama kolom fitur yang digunakan      │
+│  metrics       : Hasil evaluasi (RMSE, MAE, MAPE, R², DA)   │
+│  [config]      : Hyperparameter (untuk N-BEATS)             │
+│  [model_dir]   : Path ke model (untuk NeuralProphet)        │
+└─────────────────────────────────────────────────────────────┘
+```
+
 ### 9.4 Struktur Artifact
 
 ```python
