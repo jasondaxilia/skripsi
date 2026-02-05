@@ -824,14 +824,28 @@ Training **dilakukan offline** di Jupyter Notebooks, bukan di aplikasi Streamlit
 
 ### 9.3 Artifact Loading
 
-#### 9.3.1 Lokasi Code
+#### 9.3.1 Apa itu Artifact Loading?
+
+**Artifact Loading** adalah proses **memuat model machine learning yang sudah dilatih** dari file penyimpanan (`.joblib`) ke dalam memori komputer agar bisa digunakan untuk melakukan prediksi.
+
+**Analogi Sederhana:**  
+Seperti membuka file dokumen Word yang sudah disimpan sebelumnya. Model yang sudah "ditulis" (di-train) di Jupyter Notebook, dibuka kembali di aplikasi Streamlit untuk digunakan tanpa perlu menulis ulang (re-train).
+
+**Mengapa Disebut "Artifact"?**  
+Dalam machine learning, **artifact** adalah hasil/output dari proses training yang perlu disimpan, meliputi:
+- Model yang sudah di-train
+- Scaler/transformer untuk normalisasi data
+- Daftar fitur yang digunakan
+- Metrik evaluasi
+
+#### 9.3.2 Lokasi Code
 
 | File                  | Baris  | Fungsi                   |
 | --------------------- | ------ | ------------------------ |
 | `artifacts/loader.py` | 28-130 | `load_artifact()`        |
 | `app.py`              | 85-88  | `cached_load_artifact()` |
 
-#### 9.3.2 Implementasi
+#### 9.3.3 Implementasi
 
 ```python
 def load_artifact(path: str) -> Dict[str, Any]:
@@ -859,7 +873,9 @@ def load_artifact(path: str) -> Dict[str, Any]:
     return obj
 ```
 
-#### 9.3.3 Penjelasan Detail Artifact Loading
+#### 9.3.4 Penjelasan Detail Proses Loading
+
+##### Apa yang Terjadi Saat `load_artifact()` Dipanggil?
 
 Artifact Loading adalah proses **memuat model yang sudah dilatih** dari file `.joblib` ke dalam memori aplikasi Streamlit untuk digunakan saat prediksi (inference).
 
@@ -872,6 +888,15 @@ Artifact Loading adalah proses **memuat model yang sudah dilatih** dari file `.j
 └─────────────────┘      └─────────────────┘      └─────────────────┘      └─────────────────┘
 ```
 
+**Penjelasan setiap tahap:**
+
+| Tahap | Proses | Keterangan |
+|-------|--------|------------|
+| 1. File `.joblib` | Penyimpanan di disk | File binary yang berisi model terkompresi |
+| 2. `joblib.load()` | Deserialisasi | Mengubah binary menjadi objek Python |
+| 3. Dictionary Python | Objek di RAM | Model siap digunakan dalam memori |
+| 4. `predict_model()` | Prediksi | Model digunakan untuk forecasting |
+
 ##### Strategi Loading dengan Fallback
 
 Fungsi `load_artifact()` menggunakan **3 strategi berurutan** untuk memastikan file bisa dimuat meskipun ada masalah kompatibilitas:
@@ -881,6 +906,33 @@ Fungsi `load_artifact()` menggunakan **3 strategi berurutan** untuk memastikan f
 | 1️⃣ | `joblib.load(path)` | Normal | Default, paling cepat dan umum digunakan |
 | 2️⃣ | `joblib.load(path, mmap_mode="r")` | Memory-mapped | Jika strategi 1 gagal, cocok untuk file besar |
 | 3️⃣ | `pickle.load(file)` | Standard pickle | Fallback terakhir jika joblib tidak kompatibel |
+
+**Ilustrasi Fallback:**
+
+```
+                    ┌─────────────────┐
+                    │ joblib.load()   │
+                    │    (normal)     │
+                    └────────┬────────┘
+                             │
+                    Berhasil? ▼
+              ┌──────────────┴──────────────┐
+              │ Ya                          │ Tidak
+              ▼                             ▼
+        ┌───────────┐              ┌─────────────────┐
+        │  Selesai  │              │ joblib.load()   │
+        │  (return) │              │ (mmap_mode="r") │
+        └───────────┘              └────────┬────────┘
+                                            │
+                                   Berhasil? ▼
+                             ┌──────────────┴──────────────┐
+                             │ Ya                          │ Tidak
+                             ▼                             ▼
+                       ┌───────────┐              ┌─────────────────┐
+                       │  Selesai  │              │  pickle.load()  │
+                       │  (return) │              │   (fallback)    │
+                       └───────────┘              └─────────────────┘
+```
 
 **Mengapa perlu fallback?**
 - Versi `joblib` atau `scikit-learn` yang berbeda bisa menyebabkan incompatibility
@@ -898,11 +950,24 @@ if obj.get("model_type") == "neuralprophet":
         obj["neuralprophet"] = NeuralProphet.load(obj["model_dir"])
 ```
 
-**Alasan:**
-- NeuralProphet menggunakan **PyTorch** di belakang layar
-- Model PyTorch disimpan ke **direktori terpisah**, bukan langsung ke file `.joblib`
-- Artifact `.joblib` hanya menyimpan **path ke direktori model** (`model_dir`)
-- Saat loading, model NeuralProphet dimuat dari direktori tersebut
+**Mengapa NeuralProphet Berbeda?**
+
+| Aspek | Model Lain | NeuralProphet |
+|-------|------------|---------------|
+| **Backend** | Scikit-learn / Statsmodels | PyTorch |
+| **Penyimpanan** | Langsung ke `.joblib` | Direktori terpisah |
+| **Isi `.joblib`** | Model object | Path ke direktori (`model_dir`) |
+| **Proses Load** | 1 langkah | 2 langkah (load path → load model) |
+
+**Alur Loading NeuralProphet:**
+
+```
+┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+│  File .joblib   │ ───▶ │  Baca model_dir │ ───▶ │ NeuralProphet   │
+│  {model_dir:    │      │  (path string)  │      │   .load(dir)    │
+│   "path/to/np"} │      │                 │      │                 │
+└─────────────────┘      └─────────────────┘      └─────────────────┘
+```
 
 ##### Caching di Streamlit
 
@@ -912,6 +977,24 @@ Di `app.py`, loading artifact dibungkus dengan decorator `@st.cache_resource`:
 @st.cache_resource
 def cached_load_artifact(path: str):
     return load_artifact(path)
+```
+
+**Apa itu `@st.cache_resource`?**
+
+`@st.cache_resource` adalah decorator Streamlit yang menyimpan hasil pemanggilan fungsi ke dalam **cache**. Saat fungsi dipanggil dengan parameter yang sama, Streamlit langsung mengembalikan hasil dari cache tanpa menjalankan ulang fungsi tersebut.
+
+**Ilustrasi Perbedaan:**
+
+```
+TANPA CACHE:
+Request 1: load_artifact("model.joblib") → Baca file → 2 detik
+Request 2: load_artifact("model.joblib") → Baca file → 2 detik  (ulang!)
+Request 3: load_artifact("model.joblib") → Baca file → 2 detik  (ulang!)
+
+DENGAN CACHE:
+Request 1: load_artifact("model.joblib") → Baca file → 2 detik → Simpan ke cache
+Request 2: load_artifact("model.joblib") → Ambil dari cache → 0.001 detik ✓
+Request 3: load_artifact("model.joblib") → Ambil dari cache → 0.001 detik ✓
 ```
 
 **Keuntungan Caching:**
@@ -950,6 +1033,18 @@ Setiap artifact menyimpan **semua komponen yang diperlukan** untuk melakukan pre
 │  [model_dir]   : Path ke model (untuk NeuralProphet)        │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+**Penjelasan Setiap Komponen:**
+
+| Komponen | Tipe Data | Fungsi |
+|----------|-----------|--------|
+| `model_type` | `str` | Identifier untuk routing ke fungsi prediksi yang tepat |
+| `model object` | Objek (Prophet/XGBoost/dll) | Model yang melakukan prediksi |
+| `scaler` | `MinMaxScaler` / `DartsScaler` | Normalisasi fitur ke range [0,1] |
+| `feature_columns` | `list[str]` | Nama-nama kolom fitur yang digunakan saat training |
+| `metrics` | `dict` | Hasil evaluasi: RMSE, MAE, MAPE, R², Directional Accuracy |
+| `config` | `dict` (opsional) | Hyperparameter untuk rebuild model (N-BEATS) |
+| `model_dir` | `str` (opsional) | Path ke direktori model PyTorch (NeuralProphet) |
 
 ### 9.4 Struktur Artifact
 
