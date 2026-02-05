@@ -343,13 +343,29 @@ df_model_ready = df_model_ready.set_index("ds").asfreq("D").ffill().reset_index(
 
 ### 5.4 Windowing (untuk N-BEATS)
 
-#### 5.4.1 Lokasi Code
+#### 5.4.1 Apa itu Windowing?
+
+**Windowing** adalah teknik preprocessing yang digunakan oleh model N-BEATS untuk mengubah data time series menjadi format input yang dapat diproses oleh neural network.
+
+**Analogi Sederhana:**  
+Bayangkan Anda melihat melalui jendela kecil yang hanya menampilkan sebagian dari pemandangan. Windowing bekerja dengan cara yang sama — model hanya "melihat" sejumlah data historis tertentu (lookback window) untuk memprediksi nilai masa depan.
+
+#### 5.4.2 Mengapa Windowing Diperlukan?
+
+| Alasan | Penjelasan |
+|--------|------------|
+| **Fixed Input Size** | Neural network membutuhkan dimensi input yang konsisten dan tetap |
+| **Local Pattern** | Window menangkap pola lokal/jangka pendek dalam data |
+| **Memory Efficiency** | Tidak perlu memproses seluruh history, cukup n hari terakhir |
+| **Computational** | Mengurangi kompleksitas komputasi dibanding memproses seluruh data |
+
+#### 5.4.3 Lokasi Code
 
 | File                      | Baris   | Fungsi                                          |
 | ------------------------- | ------- | ----------------------------------------------- |
 | `artifacts/predictors.py` | 659-673 | Lookback window untuk autoregressive prediction |
 
-#### 5.4.2 Implementasi
+#### 5.4.4 Implementasi
 
 ```python
 lookback = config['lookback']  # e.g., 10 atau 20 hari
@@ -367,6 +383,123 @@ with torch.no_grad():
         # Autoregressive: update sequence dengan prediksi
         current_sequence = np.append(current_sequence[1:], pred_value)
 ```
+
+#### 5.4.5 Penjelasan Detail Proses Windowing
+
+##### Konsep Lookback Window
+
+**Lookback window** adalah jumlah hari historis yang digunakan sebagai input untuk memprediksi hari berikutnya. N-BEATS adalah model **univariate** yang hanya menggunakan data harga Close.
+
+```
+Data Time Series:  [100, 102, 98, 105, 103, 107, 110, 108, 112, 115]
+                                                    └──────────────┘
+                                                    Lookback Window
+                                                    (e.g., 5 hari)
+```
+
+##### Autoregressive Multi-Step Forecasting
+
+N-BEATS menggunakan pendekatan **iteratif** untuk prediksi multi-step. Setiap prediksi baru menjadi bagian dari input untuk prediksi selanjutnya:
+
+```
+Langkah 1: Input [hari 1-10] → Prediksi hari 11
+Langkah 2: Input [hari 2-11*] → Prediksi hari 12  (* = hasil prediksi)
+Langkah 3: Input [hari 3-12*] → Prediksi hari 13
+... dan seterusnya hingga horizon tercapai
+```
+
+##### Ilustrasi Visual Proses Windowing
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    WINDOWING PROCESS                                │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Historical Data (scaled):                                          │
+│  [0.1, 0.2, 0.15, 0.3, 0.25, 0.4, 0.35, 0.5, 0.45, 0.6]            │
+│                                   └─────────────────────┘           │
+│                                   Lookback = 5                      │
+│                                                                     │
+│  Iterasi 1:                                                         │
+│  Input:  [0.4, 0.35, 0.5, 0.45, 0.6] → Model → Output: 0.55        │
+│                                                                     │
+│  Iterasi 2 (sequence diupdate):                                     │
+│  Input:  [0.35, 0.5, 0.45, 0.6, 0.55*] → Model → Output: 0.58      │
+│                              prediksi ↗                             │
+│                                                                     │
+│  Iterasi 3:                                                         │
+│  Input:  [0.5, 0.45, 0.6, 0.55*, 0.58*] → Model → Output: 0.62     │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+##### Alur Kerja Sliding Window
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    SLIDING WINDOW MECHANISM                         │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Step 1: Ambil lookback hari terakhir                               │
+│  ┌───────────────────────────────────────────┐                      │
+│  │ History: [d1, d2, d3, d4, d5, d6, d7, d8, d9, d10]              │
+│  │                              └────────────────────┘              │
+│  │                              Window: [d6, d7, d8, d9, d10]       │
+│  └───────────────────────────────────────────┘                      │
+│                                                                     │
+│  Step 2: Prediksi d11                                               │
+│  ┌───────────────────────────────────────────┐                      │
+│  │ Input: [d6, d7, d8, d9, d10] → N-BEATS → pred_d11               │
+│  └───────────────────────────────────────────┘                      │
+│                                                                     │
+│  Step 3: Geser window (slide) + masukkan prediksi                   │
+│  ┌───────────────────────────────────────────┐                      │
+│  │ New Window: [d7, d8, d9, d10, pred_d11]                         │
+│  │              ↑                        ↑                          │
+│  │           buang d6              tambah prediksi                  │
+│  └───────────────────────────────────────────┘                      │
+│                                                                     │
+│  Step 4: Prediksi d12                                               │
+│  ┌───────────────────────────────────────────┐                      │
+│  │ Input: [d7, d8, d9, d10, pred_d11] → N-BEATS → pred_d12         │
+│  └───────────────────────────────────────────┘                      │
+│                                                                     │
+│  ... ulangi hingga semua periode terprediksi                        │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 5.4.6 Parameter Windowing
+
+| Parameter | Deskripsi | Nilai Tipikal | Dampak |
+|-----------|-----------|---------------|--------|
+| `lookback` | Jumlah hari historis sebagai input | 10-30 hari | Lebih besar = lebih banyak konteks, tapi lebih lambat |
+| `input_size` | Sama dengan lookback | 10-30 | Dimensi input layer neural network |
+| `output_size` | Jumlah prediksi per forward pass | 1 (single-step) | Dalam aplikasi ini menggunakan iterative single-step |
+
+#### 5.4.7 Risiko Pendekatan Autoregressive
+
+> **⚠️ Error Accumulation:** Setiap prediksi yang salah akan mempengaruhi prediksi berikutnya karena menjadi bagian dari input sequence.
+
+```
+Prediksi Hari 1: Error 2%
+Prediksi Hari 2: Error 2% + propagated error = ~3-4%
+Prediksi Hari 3: Error 2% + propagated error = ~5-6%
+... error terakumulasi semakin besar seiring horizon
+```
+
+**Mitigasi dalam Aplikasi:**
+- Horizon prediksi dibatasi **5 hari** untuk meminimalkan error accumulation
+- Model di-train dengan lookback window yang optimal
+- Scaling memastikan nilai prediksi dalam range yang masuk akal
+
+#### 5.4.8 Perbandingan dengan Model Lain
+
+| Aspek | N-BEATS (Windowing) | Prophet/NeuralProphet | N-HiTS |
+|-------|---------------------|----------------------|--------|
+| **Input** | Fixed-size window | Seluruh history | Seluruh history |
+| **Multi-step** | Iterative (autoregressive) | Direct (sekali prediksi) | Direct |
+| **Error Propagation** | Ya (accumulated) | Tidak | Tidak |
+| **Flexibility** | Window size tunable | Automatic | Automatic |
 
 ### 5.5 Peran Preprocessing terhadap Performa Model
 
