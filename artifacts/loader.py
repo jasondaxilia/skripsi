@@ -117,6 +117,31 @@ def load_artifact(path: str) -> Dict[str, Any]:
                 st.warning(f"Failed to load NeuralProphet from {model_dir}: {e}")
                 # Don't cache this incomplete artifact
                 return obj
+    
+    # === CRITICAL FIX: Load N-BEATS PyTorch model from .pth file if needed ===
+    # N-BEATS saves state dict to separate .pth file (model_state_path)
+    if obj.get("model_type") == "nbeats":
+        # Check if model is in separate .pth file (new format)
+        if "model_state_path" in obj and "model_state_dict" not in obj:
+            model_state_path = obj.get("model_state_path")
+            try:
+                import torch
+                # Resolve path relative to repository root
+                pth_path = Path(model_state_path)
+                if not pth_path.is_absolute():
+                    # Try relative to current artifact location
+                    pth_path = p.parent / model_state_path
+                    if not pth_path.exists():
+                        # Try from repo root
+                        pth_path = Path(model_state_path)
+                
+                # Load state dict from .pth file
+                state_dict = torch.load(str(pth_path), map_location='cpu')
+                obj["model_state_dict"] = state_dict
+                print(f"✅ Loaded N-BEATS state dict from: {pth_path}")
+            except Exception as e:
+                print(f"⚠️  Failed to load N-BEATS from {model_state_path}: {e}")
+                # Continue anyway - predictors.py will handle fallback
 
     # Cache the successfully loaded dict artifact
     _ARTIFACT_CACHE[key] = obj

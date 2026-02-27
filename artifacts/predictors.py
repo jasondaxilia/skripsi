@@ -35,6 +35,7 @@ def _np_expected_regressors(m) -> List[str]:
         "regressors_config",
         "config_regressors",
         "future_regressors",
+        "config_covar",  # NeuralProphet stores covariates here
     ]:
         try:
             obj = getattr(cfg if cfg is not None else m, attr, None)
@@ -113,13 +114,26 @@ def _predict_prophet(m, df: pd.DataFrame, feature_cols: List[str] | None, period
             # add missing regressors with last-known values if possible
             for c in missing:
                 future[c] = df[c].iloc[-1] if c in df.columns else 0.0
+        
         # Apply scaler if provided to match training-time preprocessing
         if scaler is not None:
             try:
-                Xf = future[feature_cols].values
-                Xf_scaled = scaler.transform(Xf)
-                future.loc[:, feature_cols] = Xf_scaled
-            except Exception:
+                # Filter to only features that scaler was fitted on
+                # Scaler has feature_names_in_ attribute after fitting
+                if hasattr(scaler, 'feature_names_in_'):
+                    scaler_features = list(scaler.feature_names_in_)
+                    # Only scale features that scaler knows about
+                    features_to_scale = [c for c in feature_cols if c in scaler_features]
+                else:
+                    # Fallback: assume all feature_cols were used
+                    features_to_scale = feature_cols
+                
+                if features_to_scale:
+                    Xf = future[features_to_scale].values
+                    Xf_scaled = scaler.transform(Xf)
+                    future.loc[:, features_to_scale] = Xf_scaled
+            except Exception as e:
+                st.warning(f"Feature scaling skipped: {e}")
                 pass
     fc = m.predict(future)
     return fc[["ds", "yhat"]]
@@ -149,22 +163,47 @@ def _predict_neuralprophet(m, df: pd.DataFrame, feature_cols: List[str] | None, 
             raise ValueError("NeuralProphet requires 'y' or 'Close' column")
 
     # Determine features from model or fallback to provided
+    # PRIORITY: Use artifact's feature_columns (most reliable, saved from notebook)
+    # FALLBACK: Introspect model config (less reliable, may have false positives)
     expected_regs = _np_expected_regressors(m)
-    use_feature_cols = expected_regs or feature_cols or []
+    
+    # Prefer feature_cols from artifact over introspection
+    if feature_cols:
+        use_feature_cols = feature_cols
+    elif expected_regs:
+        use_feature_cols = expected_regs
+    else:
+        use_feature_cols = []
 
-    # === CRITICAL: Prepare input with SCALED features (notebook approach) ===
+    #  === CRITICAL: Prepare input with SCALED features (notebook approach) ===
+    # Use features from expected regressors or feature_columns
+    # DON'T blindly filter OHLCV - some models may use Volume as regressor
     if use_feature_cols:
-        # Ensure all features exist
-        for c in use_feature_cols:
-            if c not in df_in.columns:
-                df_in[c] = 0.0
+        # Only filter features that actually exist in the input dataframe
+        # Let the model decide if it needs OHLCV columns or not
+        actual_features = [c for c in use_feature_cols if c in df_in.columns]
         
-        # Scale features ONLY (not target 'y' - NeuralProphet handles that)
-        if scaler is not None:
+        if actual_features and scaler is not None:
             try:
-                df_in[use_feature_cols] = scaler.transform(df_in[use_feature_cols])
+                # CRITICAL: Scaler must receive features in EXACT same order as fit time
+                # Check if scaler has feature_names_in_ (sklearn 1.0+)
+                if hasattr(scaler, 'feature_names_in_'):
+                    scaler_features = list(scaler.feature_names_in_)
+                    # Only scale features that scaler knows, PRESERVE ORDER from scaler.feature_names_in_
+                    features_to_scale = [c for c in scaler_features if c in actual_features and c in df_in.columns]
+                else:
+                    features_to_scale = actual_features
+                
+                if features_to_scale:
+                    # Transform with exact order
+                    scaled_values = scaler.transform(df_in[features_to_scale])
+                    df_in[features_to_scale] = scaled_values
             except Exception as e:
                 st.warning(f"Feature scaling failed: {e}")
+                # Continue without scaling
+                pass
+    else:
+        actual_features = []
 
     # Clean up: drop 'Close' if exists to avoid confusion
     if "Close" in df_in.columns:
@@ -183,8 +222,13 @@ def _predict_neuralprophet(m, df: pd.DataFrame, feature_cols: List[str] | None, 
     # CRITICAL: NeuralProphet REQUIRES 'y' column even for future (use NaN)
     future["y"] = np.nan
     
-    # Add all features (carry-forward last SCALED value from df_in)
-    for c in use_feature_cols:
+    # Filter base OHLCV columns (High/Low/Open/Close)
+    # Exception: Keep Volume if it's in the feature list (commonly used as regressor)
+    base_ohlcv_to_exclude = {'High', 'Low', 'Open', 'Close'}
+    features_to_add = [c for c in actual_features if c not in base_ohlcv_to_exclude]
+    
+    # Add ONLY technical indicators and Volume (NOT base OHLCV)
+    for c in features_to_add:
         if c in df_in.columns:
             future[c] = df_in[c].iloc[-1]
         else:
@@ -194,15 +238,78 @@ def _predict_neuralprophet(m, df: pd.DataFrame, feature_cols: List[str] | None, 
     try:
         fc = m.predict(future)
     except Exception as e:
-        st.error(f"❌ NeuralProphet prediction failed")
-        st.write("Error:", str(e))
-        st.write("Future shape:", future.shape)
-        st.write("Future columns:", future.columns.tolist())
-        st.write("Future sample:", future.head(2))
-        if use_feature_cols:
-            st.write("Expected features:", use_feature_cols)
-            st.write("Missing:", [c for c in use_feature_cols if c not in future.columns])
-        raise
+        error_msg = str(e)
+        
+        # === DEFENSIVE: Handle both missing AND unexpected columns ===
+        
+        # Case 1: "Unexpected column X" - need to REMOVE column
+        if "Unexpected column" in error_msg:
+            import re
+            match = re.search(r"Unexpected column ([A-Za-z0-9_]+)", error_msg)
+            if match:
+                unexpected_col = match.group(1)
+                if unexpected_col in future.columns:
+                    st.warning(f"⚠️ Removing unexpected column '{unexpected_col}' from future and retrying...")
+                    future = future.drop(columns=[unexpected_col])
+                    # Also remove from actual_features to avoid re-adding
+                    if unexpected_col in actual_features:
+                        actual_features.remove(unexpected_col)
+                    try:
+                        fc = m.predict(future)
+                        st.success(f"✅ Retry successful after removing '{unexpected_col}'")
+                    except Exception as e2:
+                        # Still failed, show full error
+                        st.error(f"❌ NeuralProphet prediction failed even after retry")
+                        st.write("Error:", str(e2))
+                        st.write("Future shape:", future.shape)
+                        st.write("Future columns:\n" + "\n".join([f'{i}:"{c}"' for i, c in enumerate(future.columns)]))
+                        raise
+                else:
+                    st.error(f"❌ NeuralProphet prediction failed")
+                    st.write("Error:", error_msg)
+                    raise
+        
+        # Case 2: "Columns not found: 'X'" - need to ADD column
+        elif "Columns not found:" in error_msg or "Column" in error_msg:
+            # Try to extract column name and retry with that column added
+            import re
+            match = re.search(r"['\"]([A-Za-z0-9_ ]+)['\"]", error_msg)
+            if match:
+                missing_col = match.group(1)
+                if missing_col in df.columns and missing_col not in future.columns:
+                    st.warning(f"⚠️ Adding missing column '{missing_col}' to future and retrying...")
+                    future[missing_col] = df[missing_col].iloc[-1]
+                    try:
+                        fc = m.predict(future)
+                        st.success(f"✅ Retry successful after adding '{missing_col}'")
+                    except Exception as e2:
+                        # Still failed, show full error
+                        st.error(f"❌ NeuralProphet prediction failed even after retry")
+                        st.write("Error:", str(e2))
+                        st.write("Future shape:", future.shape)
+                        st.write("Future columns:\n" + "\n".join([f'{i}:"{c}"' for i, c in enumerate(future.columns)]))
+                        raise
+                else:
+                    # Column doesn't exist or already added, show error
+                    st.error(f"❌ NeuralProphet prediction failed")
+                    st.write("Error:", error_msg)
+                    raise
+            else:
+                # Can't extract column name
+                st.error(f"❌ NeuralProphet prediction failed")
+                st.write("Error:", error_msg)
+                st.write("Future shape:", future.shape)
+                st.write("Future columns:\n" + "\n".join([f'{i}:"{c}"' for i, c in enumerate(future.columns)]))
+                raise
+        else:
+            # Different error type, show details
+            st.error(f"❌ NeuralProphet prediction failed")
+            st.write("Error:", error_msg)
+            st.write("Future shape:", future.shape)
+            st.write("Future columns:\n" + "\n".join([f'{i}:"{c}"' for i, c in enumerate(future.columns)]))
+            if actual_features:
+                st.write("Expected features:\n" + "\n".join([f'{i}:"{c}"' for i, c in enumerate(actual_features)]))
+            raise
 
     # Extract predictions - yhat1 is ALREADY in original scale
     if "yhat1" in fc.columns:
@@ -272,12 +379,27 @@ def predict_model(artifact: Dict[str, Any], df: pd.DataFrame, periods: int, debu
         return out
 
     if model_type == "hybrid":
+        # Hybrid: Prophet + XGBoost for residuals
+        # Support both old format (prophet/xgb keys) and new format (hybrid dict)
         m = artifact.get("prophet")
-        xgb = artifact.get("xgb")
+        xgb = artifact.get("xgb") or artifact.get("xgboost")  # Support both 'xgb' and 'xgboost'
+        
+        # Check if stored in 'hybrid' sub-dict
+        if m is None and "hybrid" in artifact:
+            hybrid_dict = artifact["hybrid"]
+            if isinstance(hybrid_dict, dict):
+                m = hybrid_dict.get("prophet")
+                xgb = hybrid_dict.get("xgb") or hybrid_dict.get("xgboost")
+        
         feature_cols = artifact.get("feature_columns") or []
         scaler = artifact.get("scaler")
+        
         if m is None or xgb is None:
-            raise ValueError("Hybrid artifact must contain 'prophet' and 'xgb'.")
+            raise ValueError(
+                f"Hybrid artifact must contain 'prophet' and 'xgb'/'xgboost' keys. "
+                f"Found keys: {list(artifact.keys())}. "
+                f"Please re-export hybrid model with correct format."
+            )
 
         base = _predict_prophet(m, df, feature_cols, periods, scaler=scaler)
 
@@ -559,10 +681,11 @@ def predict_model(artifact: Dict[str, Any], df: pd.DataFrame, periods: int, debu
         
         # Define N-BEATS architecture classes (must match notebook)
         class NBeatsBlock(nn.Module):
-            """Single N-BEATS Block with basis expansion"""
-            def __init__(self, input_size, theta_size, basis_function, num_layers, layer_width):
+            """Single N-BEATS Block with basis expansion (FIXED VERSION FROM NOTEBOOK)"""
+            def __init__(self, input_size, output_size, theta_size, basis_function, num_layers, layer_width):
                 super().__init__()
                 self.input_size = input_size
+                self.output_size = output_size  # FIX: store output_size separately
                 self.theta_size = theta_size
                 self.basis_function = basis_function
                 
@@ -572,20 +695,21 @@ def predict_model(artifact: Dict[str, Any], df: pd.DataFrame, periods: int, debu
                     layers.extend([nn.Linear(layer_width, layer_width), nn.ReLU()])
                 self.fc = nn.Sequential(*layers)
                 
-                # Theta layers for backcast and forecast
+                # Theta for backcast uses theta_size; theta for forecast outputs output_size directly
                 self.theta_b = nn.Linear(layer_width, theta_size)
-                self.theta_f = nn.Linear(layer_width, theta_size)
+                self.theta_f = nn.Linear(layer_width, output_size)  # FIX: output_size, not theta_size
                 
             def forward(self, x):
                 h = self.fc(x)
                 theta_b = self.theta_b(h)
                 theta_f = self.theta_f(h)
                 backcast = self.basis_function(theta_b, self.input_size)
-                forecast = self.basis_function(theta_f, self.input_size)
+                # FIX: forecast is already output_size — no basis expansion needed
+                forecast = theta_f
                 return backcast, forecast
 
         class NBEATSNet(nn.Module):
-            """N-BEATS Network with multiple stacks"""
+            """N-BEATS Network with multiple stacks (FIXED VERSION FROM NOTEBOOK)"""
             def __init__(self, input_size, output_size, num_stacks=5, num_blocks=3, 
                          num_layers=4, layer_width=256, theta_size=None):
                 super().__init__()
@@ -593,9 +717,9 @@ def predict_model(artifact: Dict[str, Any], df: pd.DataFrame, periods: int, debu
                 self.output_size = output_size
                 
                 if theta_size is None:
-                    theta_size = max(input_size, output_size)
+                    theta_size = input_size  # FIX: default to input_size, not max
                 
-                # Generic basis function
+                # Basis function for backcast only (maps theta → input_size)
                 basis_function = lambda theta, size: theta[:, :size] if theta.shape[-1] >= size else \
                                  torch.nn.functional.pad(theta, (0, size - theta.shape[-1]))
                 
@@ -604,8 +728,15 @@ def predict_model(artifact: Dict[str, Any], df: pd.DataFrame, periods: int, debu
                 for _ in range(num_stacks):
                     stack = nn.ModuleList()
                     for _ in range(num_blocks):
-                        block = NBeatsBlock(input_size, theta_size, basis_function, 
-                                           num_layers, layer_width)
+                        # FIX: pass output_size to each block
+                        block = NBeatsBlock(
+                            input_size=input_size,
+                            output_size=output_size,
+                            theta_size=theta_size,
+                            basis_function=basis_function,
+                            num_layers=num_layers,
+                            layer_width=layer_width
+                        )
                         stack.append(block)
                     self.stacks.append(stack)
                     
@@ -616,30 +747,33 @@ def predict_model(artifact: Dict[str, Any], df: pd.DataFrame, periods: int, debu
                 for stack in self.stacks:
                     for block in stack:
                         backcast, block_forecast = block(residual)
+                        # Residual connection on input
                         residual = residual - backcast
-                        if block_forecast.shape[-1] >= self.output_size:
-                            forecast = forecast + block_forecast[:, :self.output_size]
-                        else:
-                            padded = torch.nn.functional.pad(
-                                block_forecast, 
-                                (0, self.output_size - block_forecast.shape[-1])
-                            )
-                            forecast = forecast + padded
+                        # Accumulate forecast — shapes always match now
+                        forecast = forecast + block_forecast
                 return forecast
         
-        # Load configuration and state_dict
-        config = artifact.get("config")
+        # Load configuration and state_dict (support both old and new formats)
+        config = artifact.get("model_config") or artifact.get("config")  # New format uses 'model_config'
         model_state_dict = artifact.get("model_state_dict")
         scaler = artifact.get("scaler")
         
+        # Support for new format: lookback/forecast_horizon at top level
+        lookback = artifact.get("lookback") or (config.get('input_size') if config else None)
+        forecast_horizon = artifact.get("forecast_horizon") or (config.get('output_size') if config else None)
+        
         if config is None or model_state_dict is None:
-            raise ValueError("N-BEATS artifact missing 'config' or 'model_state_dict'.")
+            raise ValueError(
+                f"N-BEATS artifact missing required keys. "
+                f"Found keys: {list(artifact.keys())}. "
+                f"Expected: 'model_config' (or 'config') and 'model_state_dict'."
+            )
         
         # Recreate model architecture
         device = torch.device('cpu')  # Use CPU for inference
         model = NBEATSNet(
-            input_size=config['input_size'],
-            output_size=config['output_size'],
+            input_size=config.get('input_size', lookback),
+            output_size=config.get('output_size', forecast_horizon),
             num_stacks=config.get('num_stacks', 3),
             num_blocks=config.get('num_blocks', 3),
             num_layers=config.get('num_layers', 3),
@@ -665,7 +799,6 @@ def predict_model(artifact: Dict[str, Any], df: pd.DataFrame, periods: int, debu
         
         # Extract and prepare data
         close_prices = df[target_col].values
-        lookback = config['lookback']
         
         # Scale data if scaler provided
         if scaler is not None:

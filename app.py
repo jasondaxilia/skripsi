@@ -26,27 +26,6 @@ def _ensure_export_dir() -> Path:
     return d
 
 
-def save_altair_png(chart: alt.Chart, path: Path) -> tuple[bool, str]:
-    """Save an Altair chart to a PNG file.
-    Tries vl-convert first, then kaleido. Returns (ok, message)."""
-    try:
-        # Altair 5: prefer vl-convert if available
-        chart.save(str(path), format="png", engine="vl-convert")
-        return True, f"Saved with vl-convert → {path}"
-    except Exception as e1:
-        try:
-            chart.save(str(path), format="png", engine="kaleido")
-            return True, f"Saved with kaleido → {path}"
-        except Exception as e2:
-            msg = (
-                f"Failed to export chart as PNG.\n"
-                f"vl-convert error: {e1}\n"
-                f"kaleido error: {e2}\n"
-                f"Install 'vl-convert-python' (recommended) or 'kaleido'."
-            )
-            return False, msg
-
-
 def resolve_artifact_path(preferred: str) -> str:
     p = Path(preferred)
     candidates = [
@@ -107,7 +86,7 @@ chosen_ticker = ticker
 st.info(f"Active ticker: {ticker}")
 
 # n_periods = st.slider("Forecast horizon (days)", 1, 5, 5)
-n_periods = 5
+n_periods = 1
 debug_mode = False
 
 
@@ -174,6 +153,9 @@ if predict_button:
     missing_artifacts = []
     nhits_scaler_used = False
     nhits_pred_df = None
+    
+    # Track artifact loading info for debugging
+    artifact_info = {}
 
     for name, path in models.items():
         resolved = resolve_artifact_path(path)
@@ -187,6 +169,25 @@ if predict_button:
             except Exception:
                 mtime = -1.0
             artifact = cached_load_artifact(resolved, mtime)
+            
+            # Capture artifact loading info
+            model_type = artifact.get("model_type", "unknown")
+            artifact_info[name] = {
+                "model_type": model_type,
+                "path": resolved,
+                "size_kb": Path(resolved).stat().st_size / 1024 if Path(resolved).exists() else 0,
+            }
+            
+            # Special handling for N-BEATS to show .pth loading
+            if model_type == "nbeats":
+                artifact_info[name]["has_state_dict"] = "model_state_dict" in artifact
+                artifact_info[name]["has_state_path"] = "model_state_path" in artifact
+                if "model_state_path" in artifact:
+                    pth_path = Path(artifact["model_state_path"])
+                    artifact_info[name]["pth_file"] = pth_path.name
+                    if pth_path.exists():
+                        artifact_info[name]["pth_size_mb"] = pth_path.stat().st_size / (1024 * 1024)
+                    artifact_info[name]["loaded_from_pth"] = "model_state_dict" in artifact
             # Warn if scaler missing; tailor check per model type
             if debug_mode:
                 mt = (artifact.get("model_type") or "").lower()
@@ -235,6 +236,14 @@ if predict_button:
         forecast = pd.concat(results)
         hist = feat[["ds", "Close"]].set_index("ds")
         fc = forecast.pivot(index="ds", columns="model", values="yhat")
+
+        # Anchor predictions to the last actual close so line chart connects properly
+        last_date = feat["ds"].iloc[-1]
+        last_close_val = float(feat["Close"].iloc[-1])
+        for col in fc.columns:
+            fc.loc[last_date, col] = last_close_val
+        fc = fc.sort_index()
+
 
         # Rename columns to make it clear these are prices (IDR), not generic 'yhat'
         fc = fc.rename(columns={
@@ -399,4 +408,33 @@ if predict_button:
             df_display = df_metrics[ordered_cols].set_index("No")
             st.dataframe(df_display)
         else:
-            st.info("No metrics available to display as a table.")
+            st.info("No metrics available to display as a table.")        
+        # Show artifact loading info (especially useful for N-BEATS .pth loading verification)
+        artifact_info = None
+        if artifact_info:
+            with st.expander("🔍 Artifact Loading Details", expanded=False):
+                st.caption("Technical information about loaded model artifacts")
+                
+                for model_name, info in artifact_info.items():
+                    st.markdown(f"**{model_name}**")
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.text(f"Model Type: {info.get('model_type', 'N/A')}")
+                        st.text(f"Artifact Size: {info.get('size_kb', 0):.2f} KB")
+                    
+                    with col2:
+                        # Special info for N-BEATS
+                        if info.get('model_type') == 'nbeats':
+                            if info.get('loaded_from_pth'):
+                                st.success("✅ Loaded from .pth file")
+                                if 'pth_file' in info:
+                                    st.text(f"PyTorch File: {info['pth_file']}")
+                                if 'pth_size_mb' in info:
+                                    st.text(f"Model Size: {info['pth_size_mb']:.2f} MB")
+                            else:
+                                st.warning("⚠️ Not loaded from .pth")
+                        else:
+                            st.text(f"Path: .../{Path(info.get('path', '')).name}")
+                    
+                    st.markdown("---")
